@@ -3,7 +3,7 @@ info:
   title: CallPulse.org Prospecting Queue API
   version: 1.0.0
 servers:
-  - url: https://REPLACE-WITH-YOUR-RENDER-URL.onrender.com
+  - url: https://callpulse-prospecting-api.onrender.com
 paths:
   /health:
     get:
