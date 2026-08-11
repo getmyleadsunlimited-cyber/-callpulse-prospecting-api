@@ -1,4 +1,4 @@
-# CallPulse.org Prospecting Agent — Render Free Starter
+# CallPulse.org Autonomous Prospecting API
 
 Use this package to test your GPT Actions on Render's free web-service tier.
 
@@ -24,10 +24,20 @@ CALLPULSE_ACTIONS_API_KEY
 Paste the updated openapi.yaml as the schema.
 
 Test:
-healthCheck → createProspect → listProspects → approveProspect → saveOutreachDraft → recordReply → markConversion
+healthCheck → listIndustryButtons → createProspect → launchSevenDayCampaign → runDueCampaignTouches → recordReplyAndStopCampaign → recordConversion
 
-## Important
-This free starter stores SQLite data in /tmp, so prospect records are NOT durable across restarts/redeploys. Use it to prove the connection works. For dependable operations, move the prospect database to a persistent PostgreSQL service such as Supabase.
+## Production campaign
+
+The service qualifies only independently verified emails in the **Final Expense** and **Auto Insurance** industries. Launching a campaign creates exactly three idempotent touches for Day 0, Day 3, and Day 6 and closes the seven-day campaign on Day 7. Replies, conversions, and suppression immediately stop further outreach.
+
+Set `DATABASE_URL` to PostgreSQL and apply `migrations/001_campaigns.sql`. Set a strong `CALLPULSE_ACTIONS_API_KEY`; authentication fails closed when it is missing. The launcher is safe by default (`CALLPULSE_DRY_RUN=true`). After configuring and validating an HTTPS `CALLPULSE_DELIVERY_WEBHOOK`, explicitly set dry-run to `false` and schedule `python launcher.py` from a trusted cron with `CALLPULSE_API_URL` and the API key. The adapter receives `to`, `message`, and `idempotency_key`; failed deliveries remain scheduled for retry.
+
+## Development
+
+```sh
+python -m pip install -r requirements-dev.txt
+pytest -q
+```
 
 ## Current offers
 Standard Start: $297 setup + $125/week + $1/recovered lead.

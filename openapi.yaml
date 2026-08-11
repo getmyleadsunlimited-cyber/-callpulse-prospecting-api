@@ -1,102 +1,73 @@
 openapi: 3.1.0
 info:
-  title: CallPulse.org Prospecting Queue API
-  version: 1.0.0
+  title: CallPulse Autonomous Campaign API
+  version: 3.0.0
+  description: Verified-email, suppression-aware autonomous seven-day outreach on days 0, 3, and 6.
 servers:
   - url: https://callpulse-prospecting-api.onrender.com
+security: [{bearerAuth: []}]
 paths:
   /health:
     get:
+      security: []
       operationId: healthCheck
-      summary: Check API health.
-      responses:
-        "200": {description: OK}
+      responses: {'200': {description: Database-connected health status}}
+  /industries:
+    get:
+      operationId: listIndustryButtons
+      summary: Return selectable Final Expense and Auto Insurance buttons.
+      responses: {'200': {description: Industry buttons}}
   /prospects:
     get:
       operationId: listProspects
-      summary: List prospects.
       parameters:
-        - in: query
-          name: status
-          schema: {type: string}
-        - in: query
-          name: limit
-          schema: {type: integer, default: 25}
-      responses:
-        "200": {description: Prospect list}
+        - {in: query, name: status, schema: {type: string}}
+        - {in: query, name: industry, schema: {type: string, enum: [Final Expense, Auto Insurance]}}
+        - {in: query, name: limit, schema: {type: integer, minimum: 1, maximum: 100, default: 25}}
+      responses: {'200': {description: Prospect list}, '401': {description: Unauthorized}}
     post:
       operationId: createProspect
-      summary: Save a researched prospect.
       requestBody:
         required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [company_name, website, industry, score, why_now, ai_recovery_opportunity]
-              properties:
-                company_name: {type: string}
-                website: {type: string}
-                industry: {type: string}
-                score: {type: integer, minimum: 0, maximum: 100}
-                why_now: {type: string}
-                ai_recovery_opportunity: {type: string}
-                decision_maker_name: {type: string}
-                decision_maker_title: {type: string}
-                best_contact_channel: {type: string}
-                verified_contact: {type: string}
-                opening_message: {type: string}
-      responses:
-        "200": {description: Saved}
-  /prospects/{prospect_id}/approve:
+        content: {application/json: {schema: {$ref: '#/components/schemas/Prospect'}}}
+      responses: {'201': {description: Created}, '409': {description: Duplicate email}, '422': {description: Unverified or invalid}}
+  /prospects/{prospect_id}/campaigns:
     post:
-      operationId: approveProspect
-      summary: Approve a prospect.
-      parameters:
-        - in: path
-          name: prospect_id
-          required: true
-          schema: {type: integer}
+      operationId: launchSevenDayCampaign
+      parameters: [{$ref: '#/components/parameters/prospectId'}]
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [approved_by]
+              required: [idempotency_key]
               properties:
-                approved_by: {type: string}
-      responses:
-        "200": {description: Approved}
-  /prospects/{prospect_id}/draft:
+                idempotency_key: {type: string, minLength: 8, maxLength: 100}
+                start_at: {type: [string, 'null'], format: date-time}
+      responses: {'201': {description: Idempotent campaign with Day 0/3/6 touches}, '409': {description: Suppressed}}
+  /launcher/run:
     post:
-      operationId: saveOutreachDraft
-      summary: Save outreach draft after approval.
+      operationId: runDueCampaignTouches
       parameters:
-        - in: path
-          name: prospect_id
-          required: true
-          schema: {type: integer}
+        - {in: query, name: now_at, schema: {type: [string, 'null'], format: date-time}}
+      responses: {'200': {description: Due-touch results}}
+  /suppressions:
+    post:
+      operationId: suppressEmail
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [message]
-              properties:
-                message: {type: string}
-      responses:
-        "200": {description: Draft saved}
+              required: [email, reason]
+              properties: {email: {type: string}, reason: {type: string}}
+      responses: {'201': {description: Recipient and campaigns suppressed}}
   /prospects/{prospect_id}/reply:
     post:
-      operationId: recordReply
-      summary: Record prospect reply.
-      parameters:
-        - in: path
-          name: prospect_id
-          required: true
-          schema: {type: integer}
+      operationId: recordReplyAndStopCampaign
+      parameters: [{$ref: '#/components/parameters/prospectId'}]
       requestBody:
         required: true
         content:
@@ -104,20 +75,12 @@ paths:
             schema:
               type: object
               required: [reply_text]
-              properties:
-                reply_text: {type: string}
-                intent: {type: string}
-      responses:
-        "200": {description: Reply saved}
+              properties: {reply_text: {type: string}, intent: {type: string, default: unknown}}
+      responses: {'200': {description: Reply recorded and campaign stopped}}
   /prospects/{prospect_id}/conversion:
     post:
-      operationId: markConversion
-      summary: Record signup stage.
-      parameters:
-        - in: path
-          name: prospect_id
-          required: true
-          schema: {type: integer}
+      operationId: recordConversion
+      parameters: [{$ref: '#/components/parameters/prospectId'}]
       requestBody:
         required: true
         content:
@@ -126,8 +89,26 @@ paths:
               type: object
               required: [conversion_stage]
               properties:
-                conversion_stage:
-                  type: string
-                  enum: [signup_link_sent, standard_start, three_day_trial, converted, declined]
-      responses:
-        "200": {description: Stage saved}
+                conversion_stage: {type: string, enum: [signup_link_sent, standard_start, three_day_trial, converted, declined]}
+      responses: {'200': {description: Conversion recorded}}
+components:
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer}
+  parameters:
+    prospectId: {in: path, name: prospect_id, required: true, schema: {type: integer}}
+  schemas:
+    Prospect:
+      type: object
+      required: [company_name, website, industry, score, why_now, ai_recovery_opportunity, verified_email, email_verified]
+      properties:
+        company_name: {type: string, minLength: 1, maxLength: 200}
+        website: {type: string, pattern: '^https?://'}
+        industry: {type: string, enum: [Final Expense, Auto Insurance]}
+        score: {type: integer, minimum: 0, maximum: 100}
+        why_now: {type: string, minLength: 1}
+        ai_recovery_opportunity: {type: string, minLength: 1}
+        decision_maker_name: {type: [string, 'null']}
+        decision_maker_title: {type: [string, 'null']}
+        verified_email: {type: string}
+        email_verified: {type: boolean}
+        opening_message: {type: [string, 'null']}
