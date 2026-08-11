@@ -62,6 +62,8 @@ def test_openapi_uses_http_bearer_security_for_protected_endpoints(client):
         ("/prospects", "get"),
         ("/prospects", "post"),
         ("/prospects/{prospect_id}/campaigns", "post"),
+        ("/prospects/{prospect_id}/campaigns", "get"),
+        ("/campaigns/{campaign_id}/deliveries", "get"),
         ("/launcher/run", "post"),
         ("/suppressions", "post"),
         ("/prospects/{prospect_id}/reply", "post"),
@@ -208,6 +210,47 @@ def test_campaign_days_idempotency_launcher_and_reply_stop(client):
     assert client.post(f"/prospects/{p['id']}/reply", json={"reply_text": "Stop", "intent": "not_interested"}, headers=headers()).status_code == 200
 
 
+def test_campaign_inspection_is_authenticated_and_missing_resources_are_404(client):
+    assert client.get("/prospects/1/campaigns").status_code == 401
+    assert client.get("/campaigns/1/deliveries").status_code == 401
+    assert client.get("/prospects/999/campaigns", headers=headers()).status_code == 404
+    assert client.get("/campaigns/999/deliveries", headers=headers()).status_code == 404
+
+
+def test_inspection_returns_three_dry_run_deliveries_without_changing_state(client):
+    import app
+
+    p = client.post("/prospects", json=prospect(), headers=headers()).json()
+    launched = client.post(
+        f"/prospects/{p['id']}/campaigns",
+        json={"start_at": datetime.now(timezone.utc).isoformat(), "idempotency_key": "inspect-123"},
+        headers=headers(),
+    ).json()
+    with app.engine.connect() as connection:
+        before_campaign = connection.exec_driver_sql("SELECT * FROM campaigns").mappings().all()
+        before_touches = connection.exec_driver_sql("SELECT * FROM campaign_touches ORDER BY day").mappings().all()
+
+    campaigns = client.get(f"/prospects/{p['id']}/campaigns", headers=headers())
+    deliveries = client.get(f"/campaigns/{launched['id']}/deliveries", headers=headers())
+
+    assert campaigns.status_code == deliveries.status_code == 200
+    assert len(campaigns.json()) == 1
+    assert campaigns.json()[0]["industry"] == "Final Expense"
+    assert campaigns.json()[0]["dry_run"] is True
+    assert campaigns.json()[0]["stopped"] is False
+    assert [state["day"] for state in campaigns.json()[0]["current_sequence_state"]] == [0, 3, 6]
+    assert len(deliveries.json()) == 3
+    assert [delivery["sequence_day"] for delivery in deliveries.json()] == [0, 3, 6]
+    assert all(delivery["dry_run"] is True for delivery in deliveries.json())
+    assert all(delivery["status"] == "scheduled" for delivery in deliveries.json())
+
+    with app.engine.connect() as connection:
+        after_campaign = connection.exec_driver_sql("SELECT * FROM campaigns").mappings().all()
+        after_touches = connection.exec_driver_sql("SELECT * FROM campaign_touches ORDER BY day").mappings().all()
+    assert before_campaign == after_campaign
+    assert before_touches == after_touches
+
+
 def test_suppression_blocks_launch(client):
     p = client.post("/prospects", json=prospect("blocked@example.com"), headers=headers()).json()
     assert client.post("/suppressions", json={"email": "BLOCKED@example.com", "reason": "opt-out"}, headers=headers()).status_code == 201
@@ -234,6 +277,20 @@ def test_migration_schema_check_covers_every_model_column(client):
     with app.engine.begin() as connection:
         connection.exec_driver_sql("ALTER TABLE prospects DROP COLUMN location")
     assert schema_drift(app.engine, app.Base.metadata) == ["missing column: prospects.location"]
+
+
+def test_inspection_fields_match_the_existing_persisted_campaign_schema(client):
+    """Document which inspection facts are durable instead of inventing columns."""
+    import app
+
+    campaign_columns = {column.name for column in app.Campaign.__table__.columns}
+    touch_columns = {column.name for column in app.Touch.__table__.columns}
+    assert campaign_columns == {"id", "prospect_id", "status", "starts_at", "ends_at"}
+    assert touch_columns == {
+        "id", "campaign_id", "day", "scheduled_at", "status", "message", "idempotency_key", "sent_at",
+    }
+    assert {"created_at", "dry_run", "stop_reason"}.isdisjoint(campaign_columns)
+    assert {"dry_run", "cancelled", "cancellation_reason", "skip_reason"}.isdisjoint(touch_columns)
 
 
 def test_render_start_applies_idempotent_location_migration_with_dry_run_enabled():
