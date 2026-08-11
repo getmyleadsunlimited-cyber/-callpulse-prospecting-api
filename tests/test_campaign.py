@@ -3,9 +3,11 @@ import json
 import re
 import subprocess
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import inspect
 
 VERTICALS = [
     "eCommerce", "Roofing", "HVAC", "Dental", "Garage Door Repair", "Plumbing",
@@ -176,3 +178,34 @@ def test_suppression_blocks_launch(client):
     assert client.post("/suppressions", json={"email": "BLOCKED@example.com", "reason": "opt-out"}, headers=headers()).status_code == 201
     response = client.post(f"/prospects/{p['id']}/campaigns", json={"idempotency_key": "request-456"}, headers=headers())
     assert response.status_code == 409
+
+
+def test_migration_schema_check_covers_every_model_column(client):
+    """A PostgreSQL startup must fail if any model column was not migrated."""
+    import app
+    from migrate import schema_drift
+
+    assert schema_drift(app.engine, app.Base.metadata) == []
+    database_columns = {
+        table.name: {column["name"] for column in inspect(app.engine).get_columns(table.name)}
+        for table in app.Base.metadata.sorted_tables
+    }
+    expected_columns = {
+        table.name: {column.name for column in table.columns}
+        for table in app.Base.metadata.sorted_tables
+    }
+    assert database_columns == expected_columns
+
+    with app.engine.begin() as connection:
+        connection.exec_driver_sql("ALTER TABLE prospects DROP COLUMN location")
+    assert schema_drift(app.engine, app.Base.metadata) == ["missing column: prospects.location"]
+
+
+def test_render_start_applies_idempotent_location_migration_with_dry_run_enabled():
+    render_config = Path("render.yaml").read_text(encoding="utf-8")
+    location_migration = Path("migrations/003_ensure_prospect_location.sql").read_text(encoding="utf-8")
+
+    assert "startCommand: python migrate.py && uvicorn app:app" in render_config
+    assert "- key: CALLPULSE_DRY_RUN\n        value: true" in render_config
+    assert "ADD COLUMN IF NOT EXISTS location" in location_migration
+    assert "DROP TABLE" not in location_migration.upper()
