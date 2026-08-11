@@ -1,133 +1,59 @@
 openapi: 3.1.0
 info:
-  title: CallPulse.org Prospecting Queue API
-  version: 1.0.0
+  title: CallPulse Prospecting API
+  version: 2.0.0
 servers:
   - url: https://callpulse-prospecting-api.onrender.com
+components:
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer}
+  schemas:
+    Campaign:
+      type: object
+      required: [name, industry]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 200}
+        industry: {type: string, enum: [Roofing, HVAC, Plumbing, Dental, Med Spa, Legal, Real Estate, Final Expense, Auto Insurance]}
+    Prospect:
+      type: object
+      required: [company_name, email, email_verified, score]
+      properties:
+        company_name: {type: string}
+        email: {type: string, format: email}
+        email_verified: {type: boolean}
+        score: {type: integer, minimum: 0, maximum: 100}
+security: [{bearerAuth: []}]
 paths:
   /health:
-    get:
-      operationId: healthCheck
-      summary: Check API health.
-      responses:
-        "200": {description: OK}
-  /prospects:
-    get:
-      operationId: listProspects
-      summary: List prospects.
-      parameters:
-        - in: query
-          name: status
-          schema: {type: string}
-        - in: query
-          name: limit
-          schema: {type: integer, default: 25}
-      responses:
-        "200": {description: Prospect list}
+    get: {operationId: health, security: [], responses: {'200': {description: Healthy}}}
+  /industries:
+    get: {operationId: industries, responses: {'200': {description: Supported industries}}}
+  /launcher:
+    get: {operationId: launcher, security: [], responses: {'200': {description: Campaign launcher HTML}}}
+  /campaigns:
+    get: {operationId: listCampaigns, responses: {'200': {description: Campaign list}}}
     post:
-      operationId: createProspect
-      summary: Save a researched prospect.
+      operationId: createCampaign
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/Campaign'}}}}
+      responses: {'201': {description: Created}, '422': {description: Invalid industry}}
+  /campaigns/{campaign_id}:
+    parameters: [{name: campaign_id, in: path, required: true, schema: {type: integer}}]
+    get: {operationId: getCampaign, responses: {'200': {description: Campaign}, '404': {description: Not found}}}
+    delete: {operationId: deleteCampaign, responses: {'204': {description: Deleted}, '404': {description: Not found}}}
+  /campaigns/{campaign_id}/prospects:
+    parameters: [{name: campaign_id, in: path, required: true, schema: {type: integer}}]
+    get: {operationId: listCampaignProspects, responses: {'200': {description: Prospect list}}}
+    post:
+      operationId: addCampaignProspect
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/Prospect'}}}}
+      responses: {'201': {description: Created or existing deduplicated prospect}}
+  /prospects/{prospect_id}/events:
+    post:
+      operationId: suppressProspect
+      parameters: [{name: prospect_id, in: path, required: true, schema: {type: integer}}]
       requestBody:
         required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [company_name, website, industry, score, why_now, ai_recovery_opportunity]
-              properties:
-                company_name: {type: string}
-                website: {type: string}
-                industry: {type: string}
-                score: {type: integer, minimum: 0, maximum: 100}
-                why_now: {type: string}
-                ai_recovery_opportunity: {type: string}
-                decision_maker_name: {type: string}
-                decision_maker_title: {type: string}
-                best_contact_channel: {type: string}
-                verified_contact: {type: string}
-                opening_message: {type: string}
-      responses:
-        "200": {description: Saved}
-  /prospects/{prospect_id}/approve:
-    post:
-      operationId: approveProspect
-      summary: Approve a prospect.
-      parameters:
-        - in: path
-          name: prospect_id
-          required: true
-          schema: {type: integer}
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [approved_by]
-              properties:
-                approved_by: {type: string}
-      responses:
-        "200": {description: Approved}
-  /prospects/{prospect_id}/draft:
-    post:
-      operationId: saveOutreachDraft
-      summary: Save outreach draft after approval.
-      parameters:
-        - in: path
-          name: prospect_id
-          required: true
-          schema: {type: integer}
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [message]
-              properties:
-                message: {type: string}
-      responses:
-        "200": {description: Draft saved}
-  /prospects/{prospect_id}/reply:
-    post:
-      operationId: recordReply
-      summary: Record prospect reply.
-      parameters:
-        - in: path
-          name: prospect_id
-          required: true
-          schema: {type: integer}
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [reply_text]
-              properties:
-                reply_text: {type: string}
-                intent: {type: string}
-      responses:
-        "200": {description: Reply saved}
-  /prospects/{prospect_id}/conversion:
-    post:
-      operationId: markConversion
-      summary: Record signup stage.
-      parameters:
-        - in: path
-          name: prospect_id
-          required: true
-          schema: {type: integer}
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [conversion_stage]
-              properties:
-                conversion_stage:
-                  type: string
-                  enum: [signup_link_sent, standard_start, three_day_trial, converted, declined]
-      responses:
-        "200": {description: Stage saved}
+        content: {application/json: {schema: {type: object, required: [event], properties: {event: {type: string, enum: [reply, opt_out, hard_bounce]}}}}}
+      responses: {'200': {description: Suppressed and pending delivery cancelled}}
+  /deliveries/run:
+    post: {operationId: runDeliveries, responses: {'200': {description: Due deliveries processed idempotently}}}

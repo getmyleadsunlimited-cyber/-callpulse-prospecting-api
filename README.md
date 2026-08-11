@@ -1,4 +1,8 @@
-# CallPulse.org Prospecting Agent — Render Free Starter
+# CallPulse.org Prospecting Campaign API
+
+Production deployments require a PostgreSQL `DATABASE_URL`. Apply SQL files in
+`migrations/` in numeric order before starting the service. The local SQLite
+fallback is intended only for development.
 
 Use this package to test your GPT Actions on Render's free web-service tier.
 
@@ -23,11 +27,20 @@ CALLPULSE_ACTIONS_API_KEY
 
 Paste the updated openapi.yaml as the schema.
 
-Test:
-healthCheck → createProspect → listProspects → approveProspect → saveOutreachDraft → recordReply → markConversion
+The checked-in `openapi.yaml` documents the campaign, prospect, suppression,
+industry, launcher, and delivery-run endpoints. Requests require the bearer API
+key except for `/`, `/health`, `/launcher`, and the generated OpenAPI document.
 
-## Important
-This free starter stores SQLite data in /tmp, so prospect records are NOT durable across restarts/redeploys. Use it to prove the connection works. For dependable operations, move the prospect database to a persistent PostgreSQL service such as Supabase.
+Prospects are deduplicated by campaign and normalized email. Every prospect is
+scheduled for Day 0, Day 3, and Day 6. A delivery is eligible only when its
+score is at least 65 and its email is verified; replies, opt-outs, and hard
+bounces cancel every remaining scheduled delivery.
+
+## Safety
+`POST /deliveries/run` advances due delivery records without connecting to an
+email provider. This makes the API safe to validate without production
+credentials or sending real email. A separately reviewed delivery worker is
+required to perform actual delivery.
 
 ## Current offers
 Standard Start: $297 setup + $125/week + $1/recovered lead.
