@@ -43,6 +43,18 @@ paths:
         content: {application/json: {schema: {$ref: '#/components/schemas/Prospect'}}}
       responses: {'201': {description: Created}, '409': {description: Duplicate email}, '422': {description: Unverified or invalid}}
   /prospects/{prospect_id}/campaigns:
+    get:
+      operationId: inspectProspectCampaigns
+      summary: Read all persisted campaign scheduling and sequence state for a prospect.
+      parameters: [{$ref: '#/components/parameters/prospectId'}]
+      responses:
+        '200':
+          description: Campaign inspection results (the dry-run flag is the current service mode)
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/CampaignInspection'}}
+        '401': {description: Unauthorized}
+        '404': {description: Prospect not found}
     post:
       operationId: launchSevenDayCampaign
       parameters: [{$ref: '#/components/parameters/prospectId'}]
@@ -57,6 +69,20 @@ paths:
                 idempotency_key: {type: string, minLength: 8, maxLength: 100}
                 start_at: {type: [string, 'null'], format: date-time}
       responses: {'201': {description: Idempotent campaign with Day 0/3/6 touches}, '409': {description: Suppressed}}
+  /campaigns/{campaign_id}/deliveries:
+    get:
+      operationId: inspectCampaignDeliveries
+      summary: Read persisted delivery/touch scheduling state without triggering delivery.
+      parameters:
+        - {in: path, name: campaign_id, required: true, schema: {type: integer}}
+      responses:
+        '200':
+          description: Delivery inspection results (the dry-run flag is the current service mode)
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/DeliveryInspection'}}
+        '401': {description: Unauthorized}
+        '404': {description: Campaign not found}
   /launcher/run:
     post:
       operationId: runDueCampaignTouches
@@ -108,6 +134,45 @@ components:
   parameters:
     prospectId: {in: path, name: prospect_id, required: true, schema: {type: integer}}
   schemas:
+    CampaignSequenceState:
+      type: object
+      required: [day, status, scheduled_at, sent_at]
+      properties:
+        day: {type: integer, enum: [0, 3, 6]}
+        status: {type: string}
+        scheduled_at: {type: string, format: date-time}
+        sent_at: {type: [string, 'null'], format: date-time}
+    CampaignInspection:
+      type: object
+      required: [id, prospect_id, industry, status, starts_at, ends_at, dry_run, current_sequence_state, stopped, stop_reason]
+      properties:
+        id: {type: integer}
+        prospect_id: {type: integer}
+        industry: {$ref: '#/components/schemas/Industry'}
+        status: {type: string}
+        starts_at: {type: string, format: date-time}
+        ends_at: {type: string, format: date-time}
+        dry_run: {type: boolean, description: Current service dry-run setting; not historically persisted per campaign.}
+        current_sequence_state: {type: array, items: {$ref: '#/components/schemas/CampaignSequenceState'}}
+        stopped: {type: boolean}
+        stop_reason: {type: [string, 'null'], description: Null because the current schema does not persist a campaign stop reason.}
+    DeliveryInspection:
+      type: object
+      required: [id, campaign_id, prospect_id, sequence_day, scheduled_at, message, status, dry_run, skipped, sent_at, cancelled, cancellation_or_skip_reason, idempotency_key]
+      properties:
+        id: {type: integer}
+        campaign_id: {type: integer}
+        prospect_id: {type: integer}
+        sequence_day: {type: integer, enum: [0, 3, 6]}
+        scheduled_at: {type: string, format: date-time}
+        message: {type: string}
+        status: {type: string}
+        dry_run: {type: boolean, description: Current service dry-run setting; a simulated status is persisted proof of dry-run processing.}
+        skipped: {type: boolean, description: Derived from the persisted delivery status.}
+        sent_at: {type: [string, 'null'], format: date-time}
+        cancelled: {type: boolean, description: Derived from the persisted delivery status.}
+        cancellation_or_skip_reason: {type: [string, 'null'], description: Null because the current schema does not persist this reason.}
+        idempotency_key: {type: string, description: Opaque delivery deduplication key; contains no provider credential.}
     Prospect:
       type: object
       required: [company_name, website, industry, score, why_now, ai_recovery_opportunity, verified_email, email_verified]

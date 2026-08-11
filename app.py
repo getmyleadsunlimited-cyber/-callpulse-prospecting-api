@@ -213,6 +213,42 @@ class ConversionIn(BaseModel):
     conversion_stage: Literal["signup_link_sent", "standard_start", "three_day_trial", "converted", "declined"]
 
 
+class CampaignSequenceState(BaseModel):
+    day: int
+    status: str
+    scheduled_at: datetime
+    sent_at: datetime | None
+
+
+class CampaignInspection(BaseModel):
+    id: int
+    prospect_id: int
+    industry: str
+    status: str
+    starts_at: datetime
+    ends_at: datetime
+    dry_run: bool
+    current_sequence_state: list[CampaignSequenceState]
+    stopped: bool
+    stop_reason: str | None
+
+
+class DeliveryInspection(BaseModel):
+    id: int
+    campaign_id: int
+    prospect_id: int
+    sequence_day: int
+    scheduled_at: datetime
+    message: str
+    status: str
+    dry_run: bool
+    skipped: bool
+    sent_at: datetime | None
+    cancelled: bool
+    cancellation_or_skip_reason: str | None
+    idempotency_key: str
+
+
 def prospect_dict(p: Prospect) -> dict:
     return {c.name: getattr(p, c.name) for c in p.__table__.columns}
 
@@ -220,6 +256,33 @@ def prospect_dict(p: Prospect) -> dict:
 def campaign_dict(c: Campaign) -> dict:
     return {"id": c.id, "prospect_id": c.prospect_id, "status": c.status, "starts_at": c.starts_at,
             "ends_at": c.ends_at, "touches": [{x.name: getattr(t, x.name) for x in t.__table__.columns} for t in sorted(c.touches, key=lambda x: x.day)]}
+
+
+def campaign_inspection(c: Campaign) -> dict:
+    return {
+        "id": c.id, "prospect_id": c.prospect_id, "industry": c.prospect.industry,
+        "status": c.status, "starts_at": c.starts_at, "ends_at": c.ends_at,
+        # Historical campaigns did not snapshot this setting; this is the current service mode.
+        "dry_run": DRY_RUN,
+        "current_sequence_state": [
+            {"day": t.day, "status": t.status, "scheduled_at": t.scheduled_at, "sent_at": t.sent_at}
+            for t in sorted(c.touches, key=lambda touch: touch.day)
+        ],
+        "stopped": c.status in {"stopped", "suppressed", "cancelled"},
+        "stop_reason": None,  # The current schema has no campaign stop-reason column.
+    }
+
+
+def delivery_inspection(t: Touch) -> dict:
+    return {
+        "id": t.id, "campaign_id": t.campaign_id, "prospect_id": t.campaign.prospect_id,
+        "sequence_day": t.day, "scheduled_at": t.scheduled_at, "message": t.message,
+        "status": t.status, "dry_run": DRY_RUN,
+        "skipped": t.status in {"suppressed", "skipped"}, "sent_at": t.sent_at,
+        "cancelled": t.status == "cancelled",
+        "cancellation_or_skip_reason": None,  # Status is persisted, but a reason is not.
+        "idempotency_key": t.idempotency_key,
+    }
 
 
 @app.get("/health")
@@ -385,6 +448,24 @@ def list_prospects(status: str | None = None, industry: str | None = None,
     if industry:
         query = query.where(Prospect.industry == industry)
     return [prospect_dict(p) for p in db.scalars(query.order_by(Prospect.score.desc()).limit(limit))]
+
+
+@app.get("/prospects/{prospect_id}/campaigns", response_model=list[CampaignInspection],
+         dependencies=[Depends(require_auth)], summary="Inspect a prospect's campaigns without changing state.")
+def inspect_prospect_campaigns(prospect_id: int, db: Session = Depends(db_session)):
+    prospect = db.get(Prospect, prospect_id)
+    if not prospect:
+        raise HTTPException(404, "Prospect not found")
+    return [campaign_inspection(c) for c in sorted(prospect.campaigns, key=lambda campaign: campaign.id)]
+
+
+@app.get("/campaigns/{campaign_id}/deliveries", response_model=list[DeliveryInspection],
+         dependencies=[Depends(require_auth)], summary="Inspect campaign deliveries without running them.")
+def inspect_campaign_deliveries(campaign_id: int, db: Session = Depends(db_session)):
+    campaign = db.get(Campaign, campaign_id)
+    if not campaign:
+        raise HTTPException(404, "Campaign not found")
+    return [delivery_inspection(t) for t in sorted(campaign.touches, key=lambda touch: touch.day)]
 
 
 @app.post("/prospects/{prospect_id}/campaigns", status_code=201, dependencies=[Depends(require_auth)])

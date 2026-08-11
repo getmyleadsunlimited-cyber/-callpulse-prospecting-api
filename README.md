@@ -24,11 +24,17 @@ CALLPULSE_ACTIONS_API_KEY
 Paste the updated openapi.yaml as the schema.
 
 Test:
-healthCheck → listIndustryButtons → createProspect → launchSevenDayCampaign → runDueCampaignTouches → recordReplyAndStopCampaign → recordConversion
+healthCheck → listIndustryButtons → createProspect → launchSevenDayCampaign → inspectProspectCampaigns → inspectCampaignDeliveries → runDueCampaignTouches → recordReplyAndStopCampaign → recordConversion
 
 ## Production campaign
 
 The service supports the business verticals exposed at `/launcher` and qualifies only prospects scoring at least 65 with independently verified business emails. Selecting a vertical supplies its CallPulse AI Website Lead Recovery opening angle. Launching a campaign creates exactly three idempotent touches for Day 0, Day 3, and Day 6 and closes the seven-day campaign on Day 7. Replies, conversions, opt-outs, hard-bounce suppressions, and other suppressions immediately stop further outreach.
+
+## Read-only campaign inspection
+
+Both inspection routes require the same `Authorization: Bearer <CALLPULSE_ACTIONS_API_KEY>` header as the write routes. `GET /prospects/{prospect_id}/campaigns` returns campaign identity, prospect and industry, status, start/end timestamps, current Day 0/3/6 sequence state, stopped state, and the current process dry-run setting. `GET /campaigns/{campaign_id}/deliveries` returns the persisted touches in sequence order with IDs, scheduling, full message, delivery status, sent timestamp, derived skipped/cancelled flags, and the opaque idempotency key. They perform reads only: neither route launches the runner, sends a message, nor commits a database transaction. A missing parent resource returns `404`.
+
+The existing schema does **not** persist a campaign creation timestamp separate from `starts_at`, a per-campaign or per-touch dry-run snapshot, a stop reason, or a touch cancellation/skip reason. Accordingly, inspection reports `starts_at` (not an invented creation time), exposes `dry_run` as the current `CALLPULSE_DRY_RUN` process setting, and returns unavailable reason fields as `null`. A persisted touch status of `simulated` is the durable evidence that a touch was processed in dry-run mode. `stopped`, `skipped`, and `cancelled` are booleans derived only from persisted status values. No API keys, delivery-provider credentials, database URLs, or access tokens are included.
 
 Set `DATABASE_URL` to PostgreSQL. Render runs `python migrate.py` before every API start, applying each pending SQL migration transactionally and checking every SQLAlchemy model table and column before serving traffic. Set a strong `CALLPULSE_ACTIONS_API_KEY`; authentication fails closed when it is missing. The launcher is safe by default (`CALLPULSE_DRY_RUN=true`). After configuring and validating an HTTPS `CALLPULSE_DELIVERY_WEBHOOK`, explicitly set dry-run to `false` and schedule `python launcher.py` from a trusted cron with `CALLPULSE_API_URL` and the API key. The adapter receives `to`, `message`, and `idempotency_key`; failed deliveries remain scheduled for retry.
 
