@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select
 from sqlalchemy.exc import IntegrityError
@@ -182,6 +183,102 @@ def campaign_dict(c: Campaign) -> dict:
 def health(db: Session = Depends(db_session)):
     db.execute(select(1))
     return {"ok": True, "database": "connected", "dry_run": DRY_RUN}
+
+
+@app.get(
+    "/launcher",
+    response_class=HTMLResponse,
+    operation_id="launcher",
+    summary="Render the CallPulse campaign launcher operator UI.",
+)
+def launcher():
+    """Render the operator UI; protected API endpoints still enforce bearer auth."""
+    industry_buttons = "".join(
+        f'<button type="button" class="industry" data-industry="{name}">{name}</button>'
+        for name in INDUSTRIES
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CallPulse Campaign Launcher</title>
+  <style>
+    :root {{ color-scheme: dark; font-family: Inter, system-ui, sans-serif; background: #07111f; color: #eaf2ff; }}
+    body {{ margin: 0; min-height: 100vh; background: radial-gradient(circle at top, #173052, #07111f 55%); }}
+    main {{ width: min(760px, calc(100% - 32px)); margin: 48px auto; }}
+    .card {{ background: #0e1c30; border: 1px solid #294363; border-radius: 18px; padding: 28px; box-shadow: 0 24px 70px #0008; }}
+    h1 {{ margin: 0 0 8px; }} .sub, .safety {{ color: #a9bdd7; line-height: 1.5; }}
+    .industries {{ display: flex; gap: 10px; margin: 22px 0; }}
+    button {{ border: 1px solid #42658e; border-radius: 10px; padding: 11px 16px; color: #eaf2ff; background: #162b46; cursor: pointer; }}
+    button.selected {{ background: #2f7cf6; border-color: #77aaff; }}
+    form {{ display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }}
+    label {{ display: grid; gap: 6px; color: #bcd0e8; font-size: .9rem; }} .wide {{ grid-column: 1 / -1; }}
+    input, textarea {{ box-sizing: border-box; width: 100%; border: 1px solid #355273; border-radius: 9px; padding: 11px; background: #091526; color: white; }}
+    textarea {{ min-height: 72px; resize: vertical; }} .check {{ display: flex; align-items: center; gap: 9px; }} .check input {{ width: auto; }}
+    #launch {{ grid-column: 1 / -1; background: #18a66a; border-color: #5ad49c; font-weight: 700; }}
+    #result {{ white-space: pre-wrap; min-height: 24px; padding-top: 12px; color: #b9d7ff; }}
+    @media (max-width: 620px) {{ form {{ grid-template-columns: 1fr; }} .wide, #launch {{ grid-column: auto; }} }}
+  </style>
+</head>
+<body><main><section class="card">
+  <h1>CallPulse Campaign Launcher</h1>
+  <p class="sub">Create a qualified prospect and schedule the safeguarded Day 0, 3, and 6 campaign.</p>
+  <div class="industries" aria-label="Industry">{industry_buttons}</div>
+  <form id="campaign-form">
+    <input id="industry" type="hidden" required>
+    <label class="wide">Bearer API key<input id="api-key" type="password" autocomplete="off" required></label>
+    <label>Company name<input id="company" required maxlength="200"></label>
+    <label>Website<input id="website" type="url" placeholder="https://" required></label>
+    <label>Qualification score<input id="score" type="number" min="0" max="100" required></label>
+    <label>Verified email<input id="email" type="email" required></label>
+    <label class="wide">Why now<textarea id="why" required></textarea></label>
+    <label class="wide">AI recovery opportunity<textarea id="opportunity" required></textarea></label>
+    <label class="wide">Opening message<textarea id="message"></textarea></label>
+    <label class="wide check"><input id="verified" type="checkbox" required> Email was independently verified</label>
+    <button id="launch" type="submit">Create prospect &amp; launch campaign</button>
+  </form>
+  <p class="safety">Authentication, industry qualification, verified-email, suppression, idempotency, dry-run, and delivery checks are enforced by the API.</p>
+  <output id="result" aria-live="polite"></output>
+</section></main>
+<script>
+  const form = document.querySelector('#campaign-form');
+  const result = document.querySelector('#result');
+  document.querySelectorAll('.industry').forEach(button => button.addEventListener('click', () => {{
+    document.querySelectorAll('.industry').forEach(item => item.classList.remove('selected'));
+    button.classList.add('selected');
+    document.querySelector('#industry').value = button.dataset.industry;
+  }}));
+  async function api(path, options) {{
+    const response = await fetch(path, options);
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.detail || `Request failed (${{response.status}})`);
+    return body;
+  }}
+  form.addEventListener('submit', async event => {{
+    event.preventDefault();
+    if (!document.querySelector('#industry').value) {{ result.textContent = 'Select an industry.'; return; }}
+    const headers = {{'Authorization': `Bearer ${{document.querySelector('#api-key').value}}`, 'Content-Type': 'application/json'}};
+    result.textContent = 'Creating qualified prospect…';
+    try {{
+      const prospect = await api('/prospects', {{method: 'POST', headers, body: JSON.stringify({{
+        company_name: document.querySelector('#company').value,
+        website: document.querySelector('#website').value,
+        industry: document.querySelector('#industry').value,
+        score: Number(document.querySelector('#score').value),
+        why_now: document.querySelector('#why').value,
+        ai_recovery_opportunity: document.querySelector('#opportunity').value,
+        verified_email: document.querySelector('#email').value,
+        email_verified: document.querySelector('#verified').checked,
+        opening_message: document.querySelector('#message').value || null
+      }})}});
+      const campaign = await api(`/prospects/${{prospect.id}}/campaigns`, {{method: 'POST', headers, body: JSON.stringify({{
+        idempotency_key: crypto.randomUUID()
+      }})}});
+      result.textContent = `Campaign #${{campaign.id}} scheduled safely for prospect #${{prospect.id}}.`;
+    }} catch (error) {{ result.textContent = `Not launched: ${{error.message}}`; }}
+  }});
+</script></body></html>"""
 
 
 @app.get("/industries", dependencies=[Depends(require_auth)])

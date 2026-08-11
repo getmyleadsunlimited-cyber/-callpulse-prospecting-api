@@ -12,6 +12,17 @@ paths:
       security: []
       operationId: healthCheck
       responses: {'200': {description: Database-connected health status}}
+  /launcher:
+    get:
+      security: []
+      operationId: launcher
+      summary: Render the CallPulse campaign launcher operator UI.
+      responses:
+        '200':
+          description: Campaign launcher HTML
+          content:
+            text/html:
+              schema: {type: string}
   /industries:
     get:
       operationId: listIndustryButtons
