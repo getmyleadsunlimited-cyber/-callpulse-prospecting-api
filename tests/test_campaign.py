@@ -35,8 +35,43 @@ def prospect(email="verified@example.com", verified=True):
             "email_verified": verified, "opening_message": "Hello"}
 
 
-def test_auth_fails_closed(client):
+def test_missing_token_returns_401(client):
     assert client.get("/prospects").status_code == 401
+
+
+def test_wrong_token_returns_401(client):
+    response = client.get("/prospects", headers={"Authorization": "Bearer wrong"})
+    assert response.status_code == 401
+
+
+def test_correct_token_allows_protected_endpoint(client):
+    response = client.get("/prospects", headers=headers())
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_openapi_uses_http_bearer_security_for_protected_endpoints(client):
+    schema = client.get("/openapi.json").json()
+    assert schema["components"]["securitySchemes"]["HTTPBearer"] == {
+        "type": "http",
+        "scheme": "bearer",
+    }
+
+    protected_operations = {
+        ("/industries", "get"),
+        ("/prospects", "get"),
+        ("/prospects", "post"),
+        ("/prospects/{prospect_id}/campaigns", "post"),
+        ("/launcher/run", "post"),
+        ("/suppressions", "post"),
+        ("/prospects/{prospect_id}/reply", "post"),
+        ("/prospects/{prospect_id}/conversion", "post"),
+    }
+    for path, method in protected_operations:
+        assert schema["paths"][path][method]["security"] == [{"HTTPBearer": []}]
+
+    assert "security" not in schema["paths"]["/health"]["get"]
+    assert "security" not in schema["paths"]["/launcher"]["get"]
 
 
 def test_launcher_exists_and_returns_campaign_ui(client):
