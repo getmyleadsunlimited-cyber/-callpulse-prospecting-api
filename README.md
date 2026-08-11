@@ -1,37 +1,34 @@
-# CallPulse.org Prospecting Agent — Render Free Starter
+# CallPulse Autonomous Prospecting API
 
-Use this package to test your GPT Actions on Render's free web-service tier.
+A PostgreSQL-backed FastAPI service for autonomous, compliance-aware seven-day prospecting campaigns. Campaigns qualify verified business contacts, suppress duplicates and opted-out/bounced contacts, and run a Day 0 / Day 3 / Day 6 sequence with at most three messages.
 
-## Deploy
-1. Create a private GitHub repo.
-2. Upload all files from this package.
-3. In Render choose New → Blueprint.
-4. Connect the repo.
-5. Render reads render.yaml and creates the free FastAPI web service.
-6. When live, open your .onrender.com URL and then /health.
-7. Replace the placeholder server URL in openapi.yaml with your actual Render URL.
-8. Commit that change.
+## Local setup
 
-## GPT Action
-Open CallPulse.org Prospecting Agent → Configure → Actions → Create new action.
+```bash
+export DATABASE_URL=postgresql+psycopg://user:password@localhost/callpulse
+export CALLPULSE_ACTIONS_API_KEY=replace-me
+pip install -r requirements.txt
+uvicorn app:app --reload
+```
 
-Authentication:
-API Key / Bearer
+For an existing database, apply `migrations/001_autonomous_campaigns.sql`. New databases are initialized on application startup. Never use the SQLite test configuration in production.
 
-Use the value Render generated for:
-CALLPULSE_ACTIONS_API_KEY
+## Houston Roofing launch
 
-Paste the updated openapi.yaml as the schema.
+POST `/campaigns` with the following production-ready initial configuration, then POST `/campaigns/{id}/start`:
 
-Test:
-healthCheck → createProspect → listProspects → approveProspect → saveOutreachDraft → recordReply → markConversion
+```json
+{"name":"Houston Roofing — 7 Day","industry":"Roofing","geography":"Houston, TX","start_date":"2026-08-11","daily_first_touch_limit":25,"timezone":"America/Chicago","minimum_score":65,"allowed_priority_levels":["A","B"],"verified_business_email_required":true,"stop_on_reply":true,"opt_out_suppression":true,"hard_bounce_suppression":true,"automatic_prospect_replenishment":true}
+```
 
-## Important
-This free starter stores SQLite data in /tmp, so prospect records are NOT durable across restarts/redeploys. Use it to prove the connection works. For dependable operations, move the prospect database to a persistent PostgreSQL service such as Supabase.
+The launcher is at `/launcher`; campaign state and stats are exposed through authenticated API actions.
 
-## Current offers
-Standard Start: $297 setup + $125/week + $1/recovered lead.
-3-Day Proof Trial: $497 setup + 3-day proof period, then $125/week + $1/recovered lead if continued.
+## Microsoft Graph
 
-Signup:
-https://CallPulse.org/AIAppointmentPlatform
+Set `MICROSOFT_GRAPH_ACCESS_TOKEN` and `MICROSOFT_GRAPH_SENDER` at runtime. `outlook.send_mail` calls Graph and raises on missing credentials or rejected requests. It never fabricates delivery. After Graph accepts a request, record it using `recordDelivery`; use its stable `campaign:{campaign}:prospect:{prospect}:step:{step}` key so retries are idempotent. Inbound reply, opt-out, and hard-bounce webhooks should immediately call their event action before another worker claims due work.
+
+## Tests
+
+```bash
+pytest -q
+```

@@ -1,133 +1,90 @@
 openapi: 3.1.0
-info:
-  title: CallPulse.org Prospecting Queue API
-  version: 1.0.0
-servers:
-  - url: https://callpulse-prospecting-api.onrender.com
+info: {title: CallPulse Autonomous Prospecting API, version: 2.0.0}
+servers: [{url: https://callpulse-prospecting-api.onrender.com}]
+components:
+  securitySchemes: {bearerAuth: {type: http, scheme: bearer}}
+  parameters:
+    CampaignId: {in: path, name: campaign_id, required: true, schema: {type: integer}}
+  schemas:
+    CampaignInput:
+      type: object
+      required: [name, industry, geography, start_date]
+      properties:
+        name: {type: string}
+        industry: {type: string, enum: [eCommerce, Roofing, HVAC, Dental, Garage Door Repair, Plumbing, Emergency Towing, Water Restoration, Mold Remediation, Pest Control, Electrical, Foundation Repair, Tree Service, Pool Service, Landscaping / Lawn Care, Med Spa, Final Expense, Auto Insurance]}
+        geography: {type: string}
+        start_date: {type: string, format: date}
+        end_date: {type: string, format: date, description: Defaults to start date plus six days.}
+        daily_first_touch_limit: {type: integer, default: 25}
+        sending_window: {type: object, additionalProperties: {type: string}, example: {start: '09:00', end: '17:00'}}
+        timezone: {type: string, default: America/Chicago}
+        minimum_score: {type: integer, default: 65}
+        allowed_priority_levels: {type: array, items: {type: string}, default: [A, B]}
+        auto_approve_qualified_prospects: {type: boolean, default: true}
+        verified_business_email_required: {type: boolean, default: true}
+        duplicate_suppression: {type: boolean, default: true}
+        opt_out_suppression: {type: boolean, default: true}
+        hard_bounce_suppression: {type: boolean, default: true}
+        stop_on_reply: {type: boolean, default: true}
+        automatic_prospect_replenishment: {type: boolean, default: true}
+    ProspectInput:
+      type: object
+      required: [company_name, website, industry, score, why_now, ai_recovery_opportunity]
+      properties:
+        company_name: {type: string}
+        website: {type: string}
+        industry: {type: string}
+        score: {type: integer, minimum: 0, maximum: 100}
+        priority: {type: string, enum: [A, B, C]}
+        why_now: {type: string}
+        ai_recovery_opportunity: {type: string}
+        verified_facts: {type: array, items: {type: string}}
+        verified_contact: {type: string, format: email}
+        email_verified: {type: boolean}
+        opening_message: {type: string}
+    DeliveryInput:
+      type: object
+      required: [prospect_id, sequence_step, idempotency_key, provider_message_id]
+      properties: {prospect_id: {type: integer}, sequence_step: {type: integer, minimum: 0, maximum: 2}, idempotency_key: {type: string}, provider_message_id: {type: string}}
+security: [{bearerAuth: []}]
 paths:
   /health:
+    get: {operationId: healthCheck, security: [], responses: {'200': {description: Healthy}}}
+  /campaigns:
+    post:
+      operationId: createCampaign
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CampaignInput'}}}}
+      responses: {'200': {description: Campaign created}}
+  /campaigns/{campaign_id}:
     get:
-      operationId: healthCheck
-      summary: Check API health.
-      responses:
-        "200": {description: OK}
-  /prospects:
-    get:
-      operationId: listProspects
-      summary: List prospects.
-      parameters:
-        - in: query
-          name: status
-          schema: {type: string}
-        - in: query
-          name: limit
-          schema: {type: integer, default: 25}
-      responses:
-        "200": {description: Prospect list}
+      operationId: getCampaign
+      parameters: [{$ref: '#/components/parameters/CampaignId'}]
+      responses: {'200': {description: Campaign}}
+  /campaigns/{campaign_id}/start:
+    post: {operationId: startCampaign, parameters: [{$ref: '#/components/parameters/CampaignId'}], responses: {'200': {description: Started}}}
+  /campaigns/{campaign_id}/pause:
+    post: {operationId: pauseCampaign, parameters: [{$ref: '#/components/parameters/CampaignId'}], responses: {'200': {description: Paused}}}
+  /campaigns/{campaign_id}/stop:
+    post: {operationId: stopCampaign, parameters: [{$ref: '#/components/parameters/CampaignId'}], responses: {'200': {description: Stopped}}}
+  /campaigns/{campaign_id}/stats:
+    get: {operationId: getCampaignStats, parameters: [{$ref: '#/components/parameters/CampaignId'}], responses: {'200': {description: Campaign stats}}}
+  /campaigns/{campaign_id}/prospects:
     post:
-      operationId: createProspect
-      summary: Save a researched prospect.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [company_name, website, industry, score, why_now, ai_recovery_opportunity]
-              properties:
-                company_name: {type: string}
-                website: {type: string}
-                industry: {type: string}
-                score: {type: integer, minimum: 0, maximum: 100}
-                why_now: {type: string}
-                ai_recovery_opportunity: {type: string}
-                decision_maker_name: {type: string}
-                decision_maker_title: {type: string}
-                best_contact_channel: {type: string}
-                verified_contact: {type: string}
-                opening_message: {type: string}
-      responses:
-        "200": {description: Saved}
-  /prospects/{prospect_id}/approve:
+      operationId: queueProspect
+      parameters: [{$ref: '#/components/parameters/CampaignId'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ProspectInput'}}}}
+      responses: {'200': {description: Qualified and queued}, '409': {description: Qualification or suppression rejected}}
+  /campaigns/{campaign_id}/followups:
+    get: {operationId: getDueFollowups, parameters: [{$ref: '#/components/parameters/CampaignId'}], responses: {'200': {description: Due sends}}}
+  /campaigns/{campaign_id}/deliveries:
     post:
-      operationId: approveProspect
-      summary: Approve a prospect.
-      parameters:
-        - in: path
-          name: prospect_id
-          required: true
-          schema: {type: integer}
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [approved_by]
-              properties:
-                approved_by: {type: string}
-      responses:
-        "200": {description: Approved}
-  /prospects/{prospect_id}/draft:
-    post:
-      operationId: saveOutreachDraft
-      summary: Save outreach draft after approval.
-      parameters:
-        - in: path
-          name: prospect_id
-          required: true
-          schema: {type: integer}
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [message]
-              properties:
-                message: {type: string}
-      responses:
-        "200": {description: Draft saved}
-  /prospects/{prospect_id}/reply:
-    post:
-      operationId: recordReply
-      summary: Record prospect reply.
-      parameters:
-        - in: path
-          name: prospect_id
-          required: true
-          schema: {type: integer}
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [reply_text]
-              properties:
-                reply_text: {type: string}
-                intent: {type: string}
-      responses:
-        "200": {description: Reply saved}
-  /prospects/{prospect_id}/conversion:
-    post:
-      operationId: markConversion
-      summary: Record signup stage.
-      parameters:
-        - in: path
-          name: prospect_id
-          required: true
-          schema: {type: integer}
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [conversion_stage]
-              properties:
-                conversion_stage:
-                  type: string
-                  enum: [signup_link_sent, standard_start, three_day_trial, converted, declined]
-      responses:
-        "200": {description: Stage saved}
+      operationId: recordDelivery
+      parameters: [{$ref: '#/components/parameters/CampaignId'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/DeliveryInput'}}}}
+      responses: {'200': {description: Delivery recorded idempotently}}
+  /events/bounce:
+    post: {operationId: recordBounce, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [prospect_id], properties: {prospect_id: {type: integer}, hard: {type: boolean, default: true}, detail: {type: string}}}}}}, responses: {'200': {description: Bounce processed}}}
+  /events/opt-out:
+    post: {operationId: recordOptOut, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [prospect_id], properties: {prospect_id: {type: integer}, detail: {type: string}}}}}}, responses: {'200': {description: Opt-out processed}}}
+  /events/replies:
+    post: {operationId: processReplies, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [prospect_id, reply_text], properties: {prospect_id: {type: integer}, reply_text: {type: string}, intent: {type: string}}}}}}, responses: {'200': {description: Reply processed}}}
