@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -9,8 +10,9 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select
 from sqlalchemy.exc import IntegrityError
@@ -119,6 +121,7 @@ class Suppression(Base):
 
 Base.metadata.create_all(engine)
 app = FastAPI(title="CallPulse Autonomous Campaign API", version="3.0.0")
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def db_session():
@@ -126,8 +129,13 @@ def db_session():
         yield db
 
 
-def require_auth(authorization: str | None = Header(default=None)):
-    if not API_KEY or authorization != f"Bearer {API_KEY}":
+def require_auth(credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme)):
+    if (
+        not API_KEY
+        or credentials is None
+        or credentials.scheme.lower() != "bearer"
+        or not hmac.compare_digest(credentials.credentials, API_KEY)
+    ):
         raise HTTPException(401, "Valid bearer authentication is required")
 
 
