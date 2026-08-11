@@ -27,6 +27,16 @@ def test_auth_fails_closed(client):
     assert client.get("/prospects").status_code == 401
 
 
+def test_launcher_exists_and_returns_campaign_ui(client):
+    response = client.get("/launcher")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "CallPulse Campaign Launcher" in response.text
+    assert "Final Expense" in response.text
+    assert "Auto Insurance" in response.text
+    assert "`/prospects/${prospect.id}/campaigns`" in response.text
+
+
 def test_verified_email_and_industry_are_required(client):
     assert client.post("/prospects", json=prospect(verified=False), headers=headers()).status_code == 422
     body = prospect(); body["industry"] = "Unknown"
