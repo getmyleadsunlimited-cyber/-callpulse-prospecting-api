@@ -25,7 +25,33 @@ API_KEY = os.getenv("CALLPULSE_ACTIONS_API_KEY", "")
 DRY_RUN = os.getenv("CALLPULSE_DRY_RUN", "true").lower() != "false"
 DELIVERY_WEBHOOK = os.getenv("CALLPULSE_DELIVERY_WEBHOOK", "")
 TOUCH_DAYS = (0, 3, 6)
-INDUSTRIES = ("Final Expense", "Auto Insurance")
+GENERAL_INDUSTRIES = (
+    "eCommerce", "Roofing", "HVAC", "Dental", "Garage Door Repair", "Plumbing",
+    "Emergency Towing", "Water Restoration", "Mold Remediation", "Pest Control",
+    "Electrical", "Foundation Repair", "Tree Service", "Pool Service",
+    "Landscaping / Lawn Care", "Med Spa",
+)
+INSURANCE_INDUSTRIES = ("Final Expense", "Auto Insurance")
+INDUSTRIES = GENERAL_INDUSTRIES + INSURANCE_INDUSTRIES
+MIN_QUALIFICATION_SCORE = 65
+DEFAULT_LOCATION = "Houston, TX"
+
+OPENING_MESSAGE_HELPERS = {
+    "Roofing": "CallPulse AI Website Lead Recovery engages inspection and replacement visitors who leave your website without calling or requesting an estimate.",
+    "HVAC": "CallPulse AI Website Lead Recovery engages AC repair and replacement visitors who leave your website without booking.",
+    "Plumbing": "CallPulse AI Website Lead Recovery engages service and emergency visitors who leave your website without calling.",
+    "Garage Door Repair": "CallPulse AI Website Lead Recovery engages repair and replacement visitors who leave your website without scheduling.",
+    "Dental": "CallPulse AI Website Lead Recovery engages treatment visitors who leave your website without booking.",
+    "Emergency Towing": "CallPulse AI Website Lead Recovery engages urgent visitors who leave your website without calling or requesting service.",
+    "eCommerce": "CallPulse AI Website Lead Recovery engages shoppers who browse and leave without purchasing or entering the normal funnel.",
+    "Final Expense": "CallPulse AI Website Lead Recovery engages quote and coverage visitors who leave without requesting information or speaking with an agent.",
+    "Auto Insurance": "CallPulse AI Website Lead Recovery engages quote and coverage visitors who leave without requesting information or speaking with an agent.",
+}
+for _industry in INDUSTRIES:
+    OPENING_MESSAGE_HELPERS.setdefault(
+        _industry,
+        "CallPulse AI Website Lead Recovery engages visitors who leave your website without calling, requesting a quote, or booking.",
+    )
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(engine, expire_on_commit=False)
 
@@ -40,6 +66,7 @@ class Prospect(Base):
     company_name: Mapped[str] = mapped_column(String(200))
     website: Mapped[str] = mapped_column(String(500))
     industry: Mapped[str] = mapped_column(String(100), index=True)
+    location: Mapped[str] = mapped_column(String(200), default=DEFAULT_LOCATION)
     score: Mapped[int] = mapped_column(Integer)
     why_now: Mapped[str] = mapped_column(Text)
     ai_recovery_opportunity: Mapped[str] = mapped_column(Text)
@@ -130,8 +157,9 @@ def deliver(email: str, message: str, idempotency_key: str) -> None:
 class ProspectIn(BaseModel):
     company_name: str = Field(min_length=1, max_length=200)
     website: str = Field(pattern=r"^https?://")
-    industry: Literal["Final Expense", "Auto Insurance"]
-    score: int = Field(ge=0, le=100)
+    industry: str
+    location: str = Field(default=DEFAULT_LOCATION, min_length=1, max_length=200)
+    score: int = Field(ge=MIN_QUALIFICATION_SCORE, le=100)
     why_now: str = Field(min_length=1)
     ai_recovery_opportunity: str = Field(min_length=1)
     decision_maker_name: str | None = None
@@ -139,6 +167,13 @@ class ProspectIn(BaseModel):
     verified_email: str
     email_verified: bool
     opening_message: str | None = None
+
+    @field_validator("industry")
+    @classmethod
+    def validate_industry(cls, value: str) -> str:
+        if value not in INDUSTRIES:
+            raise ValueError("Select a supported industry")
+        return value
 
     @field_validator("verified_email")
     @classmethod
@@ -193,10 +228,15 @@ def health(db: Session = Depends(db_session)):
 )
 def launcher():
     """Render the operator UI; protected API endpoints still enforce bearer auth."""
-    industry_buttons = "".join(
+    general_buttons = "".join(
         f'<button type="button" class="industry" data-industry="{name}">{name}</button>'
-        for name in INDUSTRIES
+        for name in GENERAL_INDUSTRIES
     )
+    insurance_buttons = "".join(
+        f'<button type="button" class="industry" data-industry="{name}">{name}</button>'
+        for name in INSURANCE_INDUSTRIES
+    )
+    opening_helpers = json.dumps(OPENING_MESSAGE_HELPERS).replace("</", "<\\/")
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -206,36 +246,53 @@ def launcher():
   <style>
     :root {{ color-scheme: dark; font-family: Inter, system-ui, sans-serif; background: #07111f; color: #eaf2ff; }}
     body {{ margin: 0; min-height: 100vh; background: radial-gradient(circle at top, #173052, #07111f 55%); }}
-    main {{ width: min(760px, calc(100% - 32px)); margin: 48px auto; }}
+    main {{ width: min(960px, calc(100% - 32px)); margin: 48px auto; }}
     .card {{ background: #0e1c30; border: 1px solid #294363; border-radius: 18px; padding: 28px; box-shadow: 0 24px 70px #0008; }}
     h1 {{ margin: 0 0 8px; }} .sub, .safety {{ color: #a9bdd7; line-height: 1.5; }}
-    .industries {{ display: flex; gap: 10px; margin: 22px 0; }}
+    .vertical-section {{ margin: 22px 0; }} .vertical-section h2 {{ margin: 18px 0 9px; font-size: 1rem; color: #c8dbf2; }}
+    .industries {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }}
     button {{ border: 1px solid #42658e; border-radius: 10px; padding: 11px 16px; color: #eaf2ff; background: #162b46; cursor: pointer; }}
     button.selected {{ background: #2f7cf6; border-color: #77aaff; }}
+    .industry {{ min-height: 48px; text-align: center; }}
     form {{ display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }}
     label {{ display: grid; gap: 6px; color: #bcd0e8; font-size: .9rem; }} .wide {{ grid-column: 1 / -1; }}
     input, textarea {{ box-sizing: border-box; width: 100%; border: 1px solid #355273; border-radius: 9px; padding: 11px; background: #091526; color: white; }}
     textarea {{ min-height: 72px; resize: vertical; }} .check {{ display: flex; align-items: center; gap: 9px; }} .check input {{ width: auto; }}
     #launch {{ grid-column: 1 / -1; background: #18a66a; border-color: #5ad49c; font-weight: 700; }}
     #result {{ white-space: pre-wrap; min-height: 24px; padding-top: 12px; color: #b9d7ff; }}
+    .summary {{ margin: 20px 0; padding: 18px; border: 1px solid #355273; border-radius: 12px; background: #091526; }}
+    .summary h2 {{ margin: 0 0 12px; font-size: 1.05rem; }} .summary dl {{ display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; margin: 0; }}
+    .summary dt {{ color: #89a4c4; }} .summary dd {{ margin: 0; font-weight: 650; }}
     @media (max-width: 620px) {{ form {{ grid-template-columns: 1fr; }} .wide, #launch {{ grid-column: auto; }} }}
   </style>
 </head>
 <body><main><section class="card">
   <h1>CallPulse Campaign Launcher</h1>
   <p class="sub">Create a qualified prospect and schedule the safeguarded Day 0, 3, and 6 campaign.</p>
-  <div class="industries" aria-label="Industry">{industry_buttons}</div>
+  <div class="vertical-section">
+    <h2>Business vertical</h2>
+    <div class="industries" aria-label="Business vertical">{general_buttons}</div>
+    <h2>Insurance</h2>
+    <div class="industries" aria-label="Insurance vertical">{insurance_buttons}</div>
+  </div>
   <form id="campaign-form">
     <input id="industry" type="hidden" required>
     <label class="wide">Bearer API key<input id="api-key" type="password" autocomplete="off" required></label>
     <label>Company name<input id="company" required maxlength="200"></label>
     <label>Website<input id="website" type="url" placeholder="https://" required></label>
-    <label>Qualification score<input id="score" type="number" min="0" max="100" required></label>
+    <label>Location<input id="location" value="{DEFAULT_LOCATION}" required maxlength="200"></label>
+    <label>Qualification score<input id="score" type="number" min="{MIN_QUALIFICATION_SCORE}" max="100" value="{MIN_QUALIFICATION_SCORE}" required></label>
     <label>Verified email<input id="email" type="email" required></label>
     <label class="wide">Why now<textarea id="why" required></textarea></label>
     <label class="wide">AI recovery opportunity<textarea id="opportunity" required></textarea></label>
     <label class="wide">Opening message<textarea id="message"></textarea></label>
     <label class="wide check"><input id="verified" type="checkbox" required> Email was independently verified</label>
+    <section class="summary wide" aria-labelledby="summary-title">
+      <h2 id="summary-title">Campaign summary</h2>
+      <dl><dt>Vertical</dt><dd id="summary-industry">Not selected</dd><dt>Geography</dt><dd id="summary-location">{DEFAULT_LOCATION}</dd>
+        <dt>Qualification</dt><dd>Score ≥ {MIN_QUALIFICATION_SCORE} + independently verified business email</dd>
+        <dt>Dry-run</dt><dd>{str(DRY_RUN).lower()}</dd><dt>Sequence</dt><dd>Day 0 / Day 3 / Day 6 · stop on reply, opt-out, or hard bounce</dd></dl>
+    </section>
     <button id="launch" type="submit">Create prospect &amp; launch campaign</button>
   </form>
   <p class="safety">Authentication, industry qualification, verified-email, suppression, idempotency, dry-run, and delivery checks are enforced by the API.</p>
@@ -244,10 +301,15 @@ def launcher():
 <script>
   const form = document.querySelector('#campaign-form');
   const result = document.querySelector('#result');
+  const openingHelpers = {opening_helpers};
+  const location = document.querySelector('#location');
+  location.addEventListener('input', () => document.querySelector('#summary-location').textContent = location.value || 'Not set');
   document.querySelectorAll('.industry').forEach(button => button.addEventListener('click', () => {{
     document.querySelectorAll('.industry').forEach(item => item.classList.remove('selected'));
     button.classList.add('selected');
     document.querySelector('#industry').value = button.dataset.industry;
+    document.querySelector('#summary-industry').textContent = button.dataset.industry;
+    document.querySelector('#message').value = openingHelpers[button.dataset.industry];
   }}));
   async function api(path, options) {{
     const response = await fetch(path, options);
@@ -265,6 +327,7 @@ def launcher():
         company_name: document.querySelector('#company').value,
         website: document.querySelector('#website').value,
         industry: document.querySelector('#industry').value,
+        location: location.value,
         score: Number(document.querySelector('#score').value),
         why_now: document.querySelector('#why').value,
         ai_recovery_opportunity: document.querySelector('#opportunity').value,
@@ -283,7 +346,8 @@ def launcher():
 
 @app.get("/industries", dependencies=[Depends(require_auth)])
 def industry_buttons():
-    return [{"label": name, "value": name} for name in INDUSTRIES]
+    return [{"label": name, "value": name, "section": "Insurance" if name in INSURANCE_INDUSTRIES else "Business verticals",
+             "opening_message": OPENING_MESSAGE_HELPERS[name]} for name in INDUSTRIES]
 
 
 @app.post("/prospects", status_code=201, dependencies=[Depends(require_auth)])
@@ -318,6 +382,8 @@ def launch_campaign(prospect_id: int, body: CampaignIn, db: Session = Depends(db
         raise HTTPException(404, "Prospect not found")
     if not p.email_verified or not p.verified_email:
         raise HTTPException(422, "A verified email is required")
+    if p.score < MIN_QUALIFICATION_SCORE:
+        raise HTTPException(422, f"Qualification score must be at least {MIN_QUALIFICATION_SCORE}")
     if db.get(Suppression, p.verified_email):
         raise HTTPException(409, "Recipient is suppressed")
     existing = db.scalar(select(Campaign).where(Campaign.prospect_id == p.id))
@@ -328,7 +394,7 @@ def launch_campaign(prospect_id: int, body: CampaignIn, db: Session = Depends(db
         start = start.replace(tzinfo=timezone.utc)
     campaign = Campaign(prospect=p, starts_at=start, ends_at=start + timedelta(days=7))
     templates = {
-        0: p.opening_message or f"A quick idea for {p.company_name}'s missed-call recovery.",
+        0: p.opening_message or OPENING_MESSAGE_HELPERS[p.industry],
         3: "Following up with a practical way to recover missed opportunities without adding staff.",
         6: "Last note from me—should I close the loop, or is a short recovery demo useful?",
     }

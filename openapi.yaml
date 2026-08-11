@@ -26,14 +26,14 @@ paths:
   /industries:
     get:
       operationId: listIndustryButtons
-      summary: Return selectable Final Expense and Auto Insurance buttons.
+      summary: Return selectable business verticals and industry opening-message helpers.
       responses: {'200': {description: Industry buttons}}
   /prospects:
     get:
       operationId: listProspects
       parameters:
         - {in: query, name: status, schema: {type: string}}
-        - {in: query, name: industry, schema: {type: string, enum: [Final Expense, Auto Insurance]}}
+        - {in: query, name: industry, schema: {$ref: '#/components/schemas/Industry'}}
         - {in: query, name: limit, schema: {type: integer, minimum: 1, maximum: 100, default: 25}}
       responses: {'200': {description: Prospect list}, '401': {description: Unauthorized}}
     post:
@@ -114,8 +114,9 @@ components:
       properties:
         company_name: {type: string, minLength: 1, maxLength: 200}
         website: {type: string, pattern: '^https?://'}
-        industry: {type: string, enum: [Final Expense, Auto Insurance]}
-        score: {type: integer, minimum: 0, maximum: 100}
+        industry: {$ref: '#/components/schemas/Industry'}
+        location: {type: string, minLength: 1, maxLength: 200, default: 'Houston, TX'}
+        score: {type: integer, minimum: 65, maximum: 100}
         why_now: {type: string, minLength: 1}
         ai_recovery_opportunity: {type: string, minLength: 1}
         decision_maker_name: {type: [string, 'null']}
@@ -123,3 +124,6 @@ components:
         verified_email: {type: string}
         email_verified: {type: boolean}
         opening_message: {type: [string, 'null']}
+    Industry:
+      type: string
+      enum: [eCommerce, Roofing, HVAC, Dental, Garage Door Repair, Plumbing, Emergency Towing, Water Restoration, Mold Remediation, Pest Control, Electrical, Foundation Repair, Tree Service, Pool Service, Landscaping / Lawn Care, Med Spa, Final Expense, Auto Insurance]
