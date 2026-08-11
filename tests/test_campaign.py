@@ -1,4 +1,7 @@
 import importlib
+import json
+import re
+import subprocess
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -46,8 +49,80 @@ def test_launcher_exists_and_returns_campaign_ui(client):
     assert "Campaign summary" in response.text
     assert "Day 0 / Day 3 / Day 6" in response.text
     assert "min=\"65\"" in response.text
-    assert "industry: document.querySelector('#industry').value" in response.text
+    # `window.location` is a browser global; redeclaring it can prevent the whole
+    # classic script from initializing in production browsers.
+    assert "const location =" not in response.text
+    assert "const locationInput =" in response.text
+    assert "industry: launcherState.selectedIndustry" in response.text
     assert "`/prospects/${prospect.id}/campaigns`" in response.text
+
+
+@pytest.mark.parametrize("industry", ["Roofing", "HVAC"])
+def test_launcher_click_selects_vertical_and_sends_it_in_prospect_payload(client, industry):
+    """Exercise the inline browser code without replacing it with a test implementation."""
+    html = client.get("/launcher").text
+    script = re.search(r"<script>(.*?)</script>", html, re.DOTALL).group(1)
+    runner = f"""
+const vm = require('node:vm');
+class Element {{
+  constructor(id, value = '') {{
+    this.id = id; this.value = value; this.checked = true; this.textContent = '';
+    this.dataset = {{}}; this.attributes = {{}}; this.listeners = {{}};
+    this.classList = {{
+      values: new Set(),
+      add: value => this.classList.values.add(value),
+      remove: value => this.classList.values.delete(value),
+      contains: value => this.classList.values.has(value)
+    }};
+  }}
+  addEventListener(type, callback) {{ this.listeners[type] = callback; }}
+  setAttribute(name, value) {{ this.attributes[name] = value; }}
+  async trigger(type) {{ return this.listeners[type]({{preventDefault() {{}}}}); }}
+}}
+const ids = {{
+  'campaign-form': new Element('campaign-form'), result: new Element('result'),
+  location: new Element('location', 'Houston, TX'), 'summary-location': new Element('summary-location'),
+  industry: new Element('industry'), 'summary-industry': new Element('summary-industry'),
+  message: new Element('message'), 'api-key': new Element('api-key', 'secret'),
+  company: new Element('company', 'Example Agency'), website: new Element('website', 'https://example.com'),
+  score: new Element('score', '91'), why: new Element('why', 'Missed calls'),
+  opportunity: new Element('opportunity', 'Immediate callbacks'),
+  email: new Element('email', '{industry.lower()}@example.com'), verified: new Element('verified')
+}};
+const buttons = ['Roofing', 'HVAC'].map(name => {{
+  const button = new Element(name); button.dataset.industry = name; return button;
+}});
+const requests = [];
+const context = {{
+  document: {{
+    querySelector: selector => ids[selector.slice(1)],
+    querySelectorAll: selector => selector === '.industry' ? buttons : []
+  }},
+  fetch: async (path, options) => {{
+    requests.push({{path, body: options.body && JSON.parse(options.body)}});
+    return {{ok: true, status: 201, json: async () => path === '/prospects' ? {{id: 17}} : {{id: 23}}}};
+  }},
+  crypto: {{randomUUID: () => '12345678-1234-1234-1234-123456789abc'}},
+  console
+}};
+Object.defineProperty(context, 'location', {{value: {{href: 'https://example.com/launcher'}}, configurable: false}});
+vm.createContext(context);
+const source = {json.dumps(script)} + `\n;globalThis.testDone = (async () => {{
+  const selected = buttons.find(button => button.dataset.industry === {json.dumps(industry)});
+  await selected.trigger('click');
+  if (!selected.classList.contains('selected')) throw new Error('button is not visibly selected');
+  if (selected.attributes['aria-pressed'] !== 'true') throw new Error('aria selection state not updated');
+  if (ids.industry.value !== {json.dumps(industry)}) throw new Error('hidden industry state not updated');
+  if (ids['summary-industry'].textContent !== {json.dumps(industry)}) throw new Error('summary not updated');
+  if (!ids.message.value.includes({json.dumps('inspection and replacement visitors' if industry == 'Roofing' else 'AC repair and replacement visitors')})) throw new Error('wrong opening message');
+  await ids['campaign-form'].trigger('submit');
+  if (requests[0].path !== '/prospects' || requests[0].body.industry !== {json.dumps(industry)}) throw new Error('wrong prospect payload');
+}})();`;
+vm.runInContext(source, context);
+context.testDone.then(() => process.stdout.write(JSON.stringify(requests[0].body))).catch(error => {{ console.error(error); process.exitCode = 1; }});
+"""
+    completed = subprocess.run(["node", "-e", runner], capture_output=True, text=True, check=True)
+    assert json.loads(completed.stdout)["industry"] == industry
 
 
 def test_verified_email_and_industry_are_required(client):

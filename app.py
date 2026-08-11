@@ -229,11 +229,11 @@ def health(db: Session = Depends(db_session)):
 def launcher():
     """Render the operator UI; protected API endpoints still enforce bearer auth."""
     general_buttons = "".join(
-        f'<button type="button" class="industry" data-industry="{name}">{name}</button>'
+        f'<button type="button" class="industry" data-industry="{name}" aria-pressed="false">{name}</button>'
         for name in GENERAL_INDUSTRIES
     )
     insurance_buttons = "".join(
-        f'<button type="button" class="industry" data-industry="{name}">{name}</button>'
+        f'<button type="button" class="industry" data-industry="{name}" aria-pressed="false">{name}</button>'
         for name in INSURANCE_INDUSTRIES
     )
     opening_helpers = json.dumps(OPENING_MESSAGE_HELPERS).replace("</", "<\\/")
@@ -302,14 +302,18 @@ def launcher():
   const form = document.querySelector('#campaign-form');
   const result = document.querySelector('#result');
   const openingHelpers = {opening_helpers};
-  const location = document.querySelector('#location');
-  location.addEventListener('input', () => document.querySelector('#summary-location').textContent = location.value || 'Not set');
+  const launcherState = {{ selectedIndustry: null }};
+  const locationInput = document.querySelector('#location');
+  locationInput.addEventListener('input', () => document.querySelector('#summary-location').textContent = locationInput.value || 'Not set');
   document.querySelectorAll('.industry').forEach(button => button.addEventListener('click', () => {{
+    const selectedIndustry = button.dataset.industry;
     document.querySelectorAll('.industry').forEach(item => item.classList.remove('selected'));
     button.classList.add('selected');
-    document.querySelector('#industry').value = button.dataset.industry;
-    document.querySelector('#summary-industry').textContent = button.dataset.industry;
-    document.querySelector('#message').value = openingHelpers[button.dataset.industry];
+    document.querySelectorAll('.industry').forEach(item => item.setAttribute('aria-pressed', String(item === button)));
+    launcherState.selectedIndustry = selectedIndustry;
+    document.querySelector('#industry').value = selectedIndustry;
+    document.querySelector('#summary-industry').textContent = selectedIndustry;
+    document.querySelector('#message').value = openingHelpers[selectedIndustry];
   }}));
   async function api(path, options) {{
     const response = await fetch(path, options);
@@ -319,15 +323,15 @@ def launcher():
   }}
   form.addEventListener('submit', async event => {{
     event.preventDefault();
-    if (!document.querySelector('#industry').value) {{ result.textContent = 'Select an industry.'; return; }}
+    if (!launcherState.selectedIndustry) {{ result.textContent = 'Select an industry.'; return; }}
     const headers = {{'Authorization': `Bearer ${{document.querySelector('#api-key').value}}`, 'Content-Type': 'application/json'}};
     result.textContent = 'Creating qualified prospect…';
     try {{
       const prospect = await api('/prospects', {{method: 'POST', headers, body: JSON.stringify({{
         company_name: document.querySelector('#company').value,
         website: document.querySelector('#website').value,
-        industry: document.querySelector('#industry').value,
-        location: location.value,
+        industry: launcherState.selectedIndustry,
+        location: locationInput.value,
         score: Number(document.querySelector('#score').value),
         why_now: document.querySelector('#why').value,
         ai_recovery_opportunity: document.querySelector('#opportunity').value,
