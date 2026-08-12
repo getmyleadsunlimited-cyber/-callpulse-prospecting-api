@@ -1,8 +1,11 @@
 """Fail-closed email providers for single-delivery canary execution."""
 from __future__ import annotations
 
-import json
+import base64
 import hashlib
+import html
+import json
+import re
 import threading
 import time
 import urllib.error
@@ -65,6 +68,48 @@ class MicrosoftGraphEmailProvider:
         self.client_id = client_id
         self._client_secret = client_secret
 
+    def _redact_client_secret(self, value: str) -> str:
+        """Remove plaintext and common direct encodings of the configured secret."""
+        secret = self._client_secret
+        if not secret:
+            return value
+        variants = {secret, html.escape(secret), json.dumps(secret)[1:-1], secret.encode().hex()}
+        variants.update({base64.b64encode(secret.encode()).decode(),
+                         base64.urlsafe_b64encode(secret.encode()).decode()})
+        # Identity providers may echo either form encoding (``+`` for spaces) or
+        # percent encoding, including an encoding that has itself been encoded.
+        encoded = {secret}
+        for _ in range(3):
+            encoded = ({urllib.parse.quote(item, safe="") for item in encoded} |
+                       {urllib.parse.quote_plus(item, safe="") for item in encoded})
+            variants.update(encoded)
+            variants.update(re.sub(r"%[0-9A-F]{2}", lambda match: match.group(0).lower(), item)
+                            for item in encoded)
+        redacted = value
+        for variant in sorted(variants, key=len, reverse=True):
+            if variant:
+                redacted = redacted.replace(variant, "[REDACTED]")
+        return redacted
+
+    def _authentication_error(self, exc: urllib.error.HTTPError) -> EmailProviderError:
+        """Build useful Entra diagnostics without retaining credential material."""
+        detail = f"microsoft graph authentication failed (HTTP {exc.code}"
+        try:
+            payload = json.loads(exc.read())
+        except (AttributeError, ValueError, TypeError, OSError):
+            payload = {}
+        error_name = payload.get("error")
+        if isinstance(error_name, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", error_name):
+            detail += f", {error_name}"
+        description = payload.get("error_description")
+        if isinstance(description, str):
+            description = self._redact_client_secret(description).replace("\r", " ").replace("\n", " ")
+            aadsts = re.search(r"AADSTS\d+:\s*.*?(?=\s+(?:Trace ID|Correlation ID|Timestamp):|$)",
+                               description, re.IGNORECASE)
+            if aadsts:
+                detail += f", {aadsts.group(0)[:300]}"
+        return EmailProviderError(detail + ")")
+
     def _access_token(self) -> str:
         # A digest distinguishes credential rotation without retaining another plaintext copy.
         key = (self.tenant_id, self.client_id,
@@ -86,7 +131,9 @@ class MicrosoftGraphEmailProvider:
             try:
                 with urllib.request.urlopen(request, timeout=20) as response:
                     payload = json.loads(response.read())
-            except (urllib.error.HTTPError, ValueError, KeyError) as exc:
+            except urllib.error.HTTPError as exc:
+                raise self._authentication_error(exc) from exc
+            except (ValueError, KeyError) as exc:
                 raise EmailProviderError("microsoft graph authentication failed") from exc
             except (urllib.error.URLError, TimeoutError) as exc:
                 raise EmailProviderError("microsoft graph authentication network failure") from exc
