@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select
@@ -94,6 +94,10 @@ class Campaign(Base):
     status: Mapped[str] = mapped_column(String(30), default="active", index=True)
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    dry_run: Mapped[bool] = mapped_column(Boolean, default=True)
+    live_authorized: Mapped[bool] = mapped_column(Boolean, default=False)
+    live_authorized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    live_authorized_by: Mapped[str | None] = mapped_column(String(200))
     prospect: Mapped[Prospect] = relationship(back_populates="campaigns")
     touches: Mapped[list[Touch]] = relationship(back_populates="campaign", cascade="all, delete-orphan")
 
@@ -109,6 +113,10 @@ class Touch(Base):
     message: Mapped[str] = mapped_column(Text)
     idempotency_key: Mapped[str] = mapped_column(String(64), unique=True)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dry_run: Mapped[bool] = mapped_column(Boolean, default=True)
+    skipped: Mapped[bool] = mapped_column(Boolean, default=False)
+    cancelled: Mapped[bool] = mapped_column(Boolean, default=False)
+    cancellation_or_skip_reason: Mapped[str | None] = mapped_column(String(300))
     campaign: Mapped[Campaign] = relationship(back_populates="touches")
 
 
@@ -194,6 +202,16 @@ class CampaignIn(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=100)
 
 
+class LiveAuthorizationIn(BaseModel):
+    authorized_by: str = ""
+    confirmation: str = ""
+
+
+class DeliveryEligibility(BaseModel):
+    eligible: bool
+    failures: list[str]
+
+
 class SuppressionIn(BaseModel):
     email: str
     reason: str = Field(min_length=1, max_length=200)
@@ -228,6 +246,9 @@ class CampaignInspection(BaseModel):
     starts_at: datetime
     ends_at: datetime
     dry_run: bool
+    live_authorized: bool
+    live_authorized_at: datetime | None
+    live_authorized_by: str | None
     current_sequence_state: list[CampaignSequenceState]
     stopped: bool
     stop_reason: str | None
@@ -255,15 +276,17 @@ def prospect_dict(p: Prospect) -> dict:
 
 def campaign_dict(c: Campaign) -> dict:
     return {"id": c.id, "prospect_id": c.prospect_id, "status": c.status, "starts_at": c.starts_at,
-            "ends_at": c.ends_at, "touches": [{x.name: getattr(t, x.name) for x in t.__table__.columns} for t in sorted(c.touches, key=lambda x: x.day)]}
+            "ends_at": c.ends_at, "dry_run": c.dry_run, "live_authorized": c.live_authorized,
+            "live_authorized_at": c.live_authorized_at, "live_authorized_by": c.live_authorized_by,
+            "touches": [{x.name: getattr(t, x.name) for x in t.__table__.columns} for t in sorted(c.touches, key=lambda x: x.day)]}
 
 
 def campaign_inspection(c: Campaign) -> dict:
     return {
         "id": c.id, "prospect_id": c.prospect_id, "industry": c.prospect.industry,
         "status": c.status, "starts_at": c.starts_at, "ends_at": c.ends_at,
-        # Historical campaigns did not snapshot this setting; this is the current service mode.
-        "dry_run": DRY_RUN,
+        "dry_run": c.dry_run, "live_authorized": c.live_authorized,
+        "live_authorized_at": c.live_authorized_at, "live_authorized_by": c.live_authorized_by,
         "current_sequence_state": [
             {"day": t.day, "status": t.status, "scheduled_at": t.scheduled_at, "sent_at": t.sent_at}
             for t in sorted(c.touches, key=lambda touch: touch.day)
@@ -277,12 +300,49 @@ def delivery_inspection(t: Touch) -> dict:
     return {
         "id": t.id, "campaign_id": t.campaign_id, "prospect_id": t.campaign.prospect_id,
         "sequence_day": t.day, "scheduled_at": t.scheduled_at, "message": t.message,
-        "status": t.status, "dry_run": DRY_RUN,
-        "skipped": t.status in {"suppressed", "skipped"}, "sent_at": t.sent_at,
-        "cancelled": t.status == "cancelled",
-        "cancellation_or_skip_reason": None,  # Status is persisted, but a reason is not.
+        "status": t.status, "dry_run": t.dry_run,
+        "skipped": t.skipped, "sent_at": t.sent_at,
+        "cancelled": t.cancelled,
+        "cancellation_or_skip_reason": t.cancellation_or_skip_reason,
         "idempotency_key": t.idempotency_key,
     }
+
+
+def prospect_suppressed(prospect: Prospect, db: Session) -> bool:
+    return prospect.status == "suppressed" or bool(
+        prospect.verified_email and db.get(Suppression, prospect.verified_email)
+    )
+
+
+def valid_outreach_destination(prospect: Prospect) -> bool:
+    if not prospect.email_verified or not prospect.verified_email or not prospect.verified_email.strip():
+        return False
+    try:
+        normalize_email(prospect.verified_email)
+    except ValueError:
+        return False
+    return prospect.status not in {"invalid", "bounced", "hard_bounce", "opted_out", "suppressed"}
+
+
+def can_execute_delivery(touch: Touch, campaign: Campaign, prospect: Prospect,
+                         db: Session, now: datetime | None = None) -> DeliveryEligibility:
+    """Return inspectable reasons rather than concealing safety decisions in a boolean."""
+    failures: list[str] = []
+    if not campaign.live_authorized: failures.append("campaign is not live authorized")
+    if campaign.dry_run: failures.append("campaign is in dry-run mode")
+    if campaign.status != "active": failures.append("campaign is not active")
+    if touch.dry_run: failures.append("delivery is in dry-run mode")
+    if touch.sent_at is not None: failures.append("delivery was already sent or simulated")
+    if touch.skipped: failures.append("delivery is skipped")
+    if touch.cancelled: failures.append("delivery is cancelled")
+    current, scheduled = now or utcnow(), touch.scheduled_at
+    if scheduled.tzinfo is None: scheduled = scheduled.replace(tzinfo=timezone.utc)
+    if current.tzinfo is None: current = current.replace(tzinfo=timezone.utc)
+    if scheduled > current: failures.append("delivery is not due")
+    if prospect_suppressed(prospect, db): failures.append("prospect is suppressed")
+    if not valid_outreach_destination(prospect): failures.append("valid outreach destination is missing")
+    if not touch.idempotency_key or not touch.idempotency_key.strip(): failures.append("delivery idempotency key is missing")
+    return DeliveryEligibility(eligible=not failures, failures=failures)
 
 
 @app.get("/health")
@@ -468,6 +528,74 @@ def inspect_campaign_deliveries(campaign_id: int, db: Session = Depends(db_sessi
     return [delivery_inspection(t) for t in sorted(campaign.touches, key=lambda touch: touch.day)]
 
 
+def authorization_failures(campaign: Campaign, body: LiveAuthorizationIn, db: Session) -> list[str]:
+    prospect = campaign.prospect
+    failures: list[str] = []
+    if not body.authorized_by.strip(): failures.append("authorized_by is required")
+    if body.confirmation != "AUTHORIZE LIVE OUTREACH": failures.append("confirmation phrase is invalid")
+    if campaign.status != "active": failures.append("campaign is stopped or cancelled")
+    if prospect_suppressed(prospect, db): failures.append("prospect is suppressed")
+    if not valid_outreach_destination(prospect): failures.append("valid outreach destination is missing")
+    if not campaign.touches: failures.append("campaign contains no deliveries")
+    if any(not touch.idempotency_key or not touch.idempotency_key.strip() for touch in campaign.touches):
+        failures.append("one or more deliveries lack an idempotency key")
+    return failures
+
+
+@app.post("/campaigns/{campaign_id}/authorize-live", dependencies=[Depends(require_auth)],
+          summary="Explicitly authorize a campaign for future live execution.")
+def authorize_live(campaign_id: int, body: LiveAuthorizationIn, db: Session = Depends(db_session)):
+    campaign = db.get(Campaign, campaign_id)
+    if not campaign:
+        raise HTTPException(404, "Campaign not found")
+    failures = authorization_failures(campaign, body, db)
+    if failures:
+        return JSONResponse(status_code=409, content={
+            "detail": "Campaign failed live authorization safety checks", "failures": failures,
+        })
+    # An identical retry is a read of the established authorization decision.
+    if not campaign.live_authorized:
+        campaign.live_authorized = True
+        campaign.live_authorized_at = utcnow()
+        campaign.live_authorized_by = body.authorized_by.strip()
+        campaign.dry_run = False
+        for touch in campaign.touches:
+            if touch.sent_at is None and not touch.skipped and not touch.cancelled:
+                touch.dry_run = False
+        db.commit()
+    return {
+        "campaign_id": campaign.id, "dry_run": campaign.dry_run,
+        "live_authorized": campaign.live_authorized,
+        "live_authorized_at": campaign.live_authorized_at,
+        "live_authorized_by": campaign.live_authorized_by,
+    }
+
+
+@app.get("/campaigns/{campaign_id}/safety", dependencies=[Depends(require_auth)],
+         summary="Inspect live-execution safety without changing state.")
+def inspect_campaign_safety(campaign_id: int, db: Session = Depends(db_session)):
+    campaign = db.get(Campaign, campaign_id)
+    if not campaign:
+        raise HTTPException(404, "Campaign not found")
+    prospect = campaign.prospect
+    eligible = [can_execute_delivery(t, campaign, prospect, db) for t in campaign.touches]
+    failures = authorization_failures(
+        campaign, LiveAuthorizationIn(authorized_by=campaign.live_authorized_by or "inspection",
+                                      confirmation="AUTHORIZE LIVE OUTREACH"), db
+    )
+    return {
+        "campaign_id": campaign.id, "dry_run": campaign.dry_run,
+        "live_authorized": campaign.live_authorized,
+        "live_authorized_at": campaign.live_authorized_at,
+        "live_authorized_by": campaign.live_authorized_by,
+        "suppressed": prospect_suppressed(prospect, db),
+        "outreach_destination_present": valid_outreach_destination(prospect),
+        "delivery_count": len(campaign.touches),
+        "eligible_delivery_count": sum(item.eligible for item in eligible),
+        "safety_failures": failures,
+    }
+
+
 @app.post("/prospects/{prospect_id}/campaigns", status_code=201, dependencies=[Depends(require_auth)])
 def launch_campaign(prospect_id: int, body: CampaignIn, db: Session = Depends(db_session)):
     p = db.get(Prospect, prospect_id)
@@ -511,17 +639,21 @@ def run_launcher(now_at: datetime | None = None, db: Session = Depends(db_sessio
         p = touch.campaign.prospect
         if touch.campaign.status != "active" or p.status in {"replied", "qualified", "converted", "suppressed"} or db.get(Suppression, p.verified_email):
             touch.status = "suppressed"
+            touch.skipped = True
+            touch.cancellation_or_skip_reason = "prospect suppression or campaign stop"
             skipped += 1
-        else:
+        elif touch.campaign.dry_run:
             try:
-                if not DRY_RUN:
-                    deliver(p.verified_email, touch.message, touch.idempotency_key)
-                touch.status = "simulated" if DRY_RUN else "sent"
+                touch.status = "simulated"
                 touch.sent_at = current
                 sent += 1
             except Exception:
                 # Leave the touch scheduled for a safe retry; never claim an unconfirmed send.
                 failed += 1
+        else:
+            # Live-authorized records are only made eligible here. Provider execution is
+            # deliberately outside this API and this safety-gate implementation.
+            can_execute_delivery(touch, touch.campaign, p, db, current)
     db.commit()
     return {"processed": len(due), "sent_or_simulated": sent, "suppressed": skipped, "failed": failed, "dry_run": DRY_RUN}
 
@@ -536,6 +668,11 @@ def suppress(body: SuppressionIn, db: Session = Depends(db_session)):
         p.status = "suppressed"
         for campaign in p.campaigns:
             campaign.status = "suppressed"
+            for touch in campaign.touches:
+                if touch.sent_at is None and not touch.skipped and not touch.cancelled:
+                    touch.status = "suppressed"
+                    touch.skipped = True
+                    touch.cancellation_or_skip_reason = f"suppression: {body.reason}"
     db.commit()
     return {"email": item.email, "reason": item.reason}
 
