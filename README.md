@@ -48,6 +48,25 @@ An authenticated operator must call `POST /campaigns/{campaign_id}/authorize-liv
 
 Set `DATABASE_URL` to PostgreSQL. Render runs `python migrate.py` before every API start, applying each pending SQL migration transactionally and checking every SQLAlchemy model table and column before serving traffic. Set a strong `CALLPULSE_ACTIONS_API_KEY`; authentication fails closed when it is missing. New campaigns are safe by default regardless of process configuration. No messaging-provider setup is part of this safety-gate release.
 
+## Canary Live Execution
+
+The deliberately manual lifecycle is:
+
+**Dry Run → Safety Inspection → Explicit Live Authorization → Canary Preflight → Explicit ONE-Delivery Canary → Persist Result → Manual Review**
+
+Use authenticated `GET /deliveries/{delivery_id}/canary-preflight` to inspect current delivery, campaign, recipient, suppression, stop-state, sender, and idempotency gates without changing state. Then call `POST /campaigns/{campaign_id}/canary-execute` with the persisted delivery ID, a non-empty operator identity, and the exact confirmation `EXECUTE ONE CANARY DELIVERY`. The endpoint accepts neither message content nor batch size; it uses the exact persisted email message.
+
+**ONE request = maximum ONE email transmission attempt.** An atomic database claim transitions only the named delivery to `sending`. Concurrent requests cannot own it, and a retry after confirmed success reads the persisted result without sending again. Results are persisted on the delivery and in a non-secret audit record. `GET /deliveries/{delivery_id}/execution` is read-only. No automatic retry, follow-up, Day 3/Day 6 execution, scheduler, worker, or campaign-wide send is enabled.
+
+Real delivery remains fail-closed by default:
+
+```text
+CALLPULSE_EMAIL_PROVIDER=disabled
+CALLPULSE_EMAIL_FROM=
+```
+
+The existing HTTPS operator webhook adapter now implements the explicit `EmailDeliveryProvider` boundary. Legitimate use requires `CALLPULSE_EMAIL_PROVIDER=webhook`, an approved `CALLPULSE_EMAIL_FROM`, and an HTTPS `CALLPULSE_DELIVERY_WEBHOOK`. The deterministic `mock` provider is test-only and performs no network I/O. No Outlook/Microsoft Graph adapter or credentials exist in this repository. A future Graph adapter would require an approved sender plus legitimately provisioned tenant ID, client ID, and client credential/token configuration; these are not currently consumed, and Outlook is not assumed connected.
+
 ## Development
 
 ```sh

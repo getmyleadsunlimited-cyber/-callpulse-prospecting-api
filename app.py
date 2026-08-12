@@ -6,7 +6,6 @@ import hmac
 import json
 import os
 import re
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
@@ -14,9 +13,11 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+
+from email_providers import configured_provider
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:////tmp/callpulse.db")
 if DATABASE_URL.startswith("postgres://"):
@@ -26,6 +27,8 @@ elif DATABASE_URL.startswith("postgresql://"):
 API_KEY = os.getenv("CALLPULSE_ACTIONS_API_KEY", "")
 DRY_RUN = os.getenv("CALLPULSE_DRY_RUN", "true").lower() != "false"
 DELIVERY_WEBHOOK = os.getenv("CALLPULSE_DELIVERY_WEBHOOK", "")
+EMAIL_PROVIDER_NAME = os.getenv("CALLPULSE_EMAIL_PROVIDER", "disabled").strip().lower()
+EMAIL_FROM = os.getenv("CALLPULSE_EMAIL_FROM", "").strip()
 TOUCH_DAYS = (0, 3, 6)
 GENERAL_INDUSTRIES = (
     "eCommerce", "Roofing", "HVAC", "Dental", "Garage Door Repair", "Plumbing",
@@ -117,6 +120,13 @@ class Touch(Base):
     skipped: Mapped[bool] = mapped_column(Boolean, default=False)
     cancelled: Mapped[bool] = mapped_column(Boolean, default=False)
     cancellation_or_skip_reason: Mapped[str | None] = mapped_column(String(300))
+    execution_status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    execution_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    execution_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    provider_name: Mapped[str | None] = mapped_column(String(40))
+    provider_message_id: Mapped[str | None] = mapped_column(String(300))
+    last_execution_error: Mapped[str | None] = mapped_column(String(500))
+    execution_attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     campaign: Mapped[Campaign] = relationship(back_populates="touches")
 
 
@@ -125,6 +135,24 @@ class Suppression(Base):
     email: Mapped[str] = mapped_column(String(320), primary_key=True)
     reason: Mapped[str] = mapped_column(String(200))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class CanaryExecutionAudit(Base):
+    __tablename__ = "canary_execution_audits"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id", ondelete="CASCADE"), index=True)
+    delivery_id: Mapped[int] = mapped_column(ForeignKey("campaign_touches.id", ondelete="CASCADE"), index=True)
+    prospect_id: Mapped[int] = mapped_column(ForeignKey("prospects.id", ondelete="CASCADE"), index=True)
+    authorized_by: Mapped[str] = mapped_column(String(200))
+    authorization_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    execution_requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    sender_identity: Mapped[str] = mapped_column(String(320))
+    recipient_email: Mapped[str] = mapped_column(String(320))
+    idempotency_key: Mapped[str] = mapped_column(String(64), index=True)
+    provider_name: Mapped[str] = mapped_column(String(40))
+    provider_message_id: Mapped[str | None] = mapped_column(String(300))
+    result: Mapped[str] = mapped_column(String(30))
+    failure_reason: Mapped[str | None] = mapped_column(String(1000))
 
 
 Base.metadata.create_all(engine)
@@ -158,16 +186,11 @@ def normalize_email(email: str) -> str:
     return email
 
 
+# Backward-compatible name for integrations that imported the old adapter. Canary
+# execution does not use this function; it always goes through EmailDeliveryProvider.
 def deliver(email: str, message: str, idempotency_key: str) -> None:
-    """Send through the operator's HTTPS adapter; non-2xx responses fail the touch."""
-    if not DELIVERY_WEBHOOK.startswith("https://"):
-        raise RuntimeError("CALLPULSE_DELIVERY_WEBHOOK must be an HTTPS URL")
-    payload = json.dumps({"to": email, "message": message, "idempotency_key": idempotency_key}).encode()
-    request = urllib.request.Request(DELIVERY_WEBHOOK, data=payload, method="POST", headers={
-        "Content-Type": "application/json", "Idempotency-Key": idempotency_key})
-    with urllib.request.urlopen(request, timeout=20) as response:
-        if not 200 <= response.status < 300:
-            raise RuntimeError(f"Delivery adapter returned HTTP {response.status}")
+    configured_provider("webhook", DELIVERY_WEBHOOK).send(
+        sender=EMAIL_FROM, recipient=email, message=message, idempotency_key=idempotency_key)
 
 
 class ProspectIn(BaseModel):
@@ -205,6 +228,12 @@ class CampaignIn(BaseModel):
 class LiveAuthorizationIn(BaseModel):
     authorized_by: str = ""
     confirmation: str = ""
+
+
+class CanaryExecutionIn(BaseModel):
+    authorized_by: str = ""
+    confirmation: str = ""
+    delivery_id: int
 
 
 class DeliveryEligibility(BaseModel):
@@ -325,7 +354,10 @@ def valid_outreach_destination(prospect: Prospect) -> bool:
 
 
 def can_execute_delivery(touch: Touch, campaign: Campaign, prospect: Prospect,
-                         db: Session, now: datetime | None = None) -> DeliveryEligibility:
+                         db: Session, now: datetime | None = None, *,
+                         authorized_by: str = "inspection",
+                         confirmation: str = "EXECUTE ONE CANARY DELIVERY",
+                         check_provider: bool = False) -> DeliveryEligibility:
     """Return inspectable reasons rather than concealing safety decisions in a boolean."""
     failures: list[str] = []
     if not campaign.live_authorized: failures.append("campaign is not live authorized")
@@ -335,14 +367,46 @@ def can_execute_delivery(touch: Touch, campaign: Campaign, prospect: Prospect,
     if touch.sent_at is not None: failures.append("delivery was already sent or simulated")
     if touch.skipped: failures.append("delivery is skipped")
     if touch.cancelled: failures.append("delivery is cancelled")
+    if touch.execution_status == "sending": failures.append("another execution is already in flight")
     current, scheduled = now or utcnow(), touch.scheduled_at
     if scheduled.tzinfo is None: scheduled = scheduled.replace(tzinfo=timezone.utc)
     if current.tzinfo is None: current = current.replace(tzinfo=timezone.utc)
     if scheduled > current: failures.append("delivery is not due")
     if prospect_suppressed(prospect, db): failures.append("prospect is suppressed")
     if not valid_outreach_destination(prospect): failures.append("valid outreach destination is missing")
+    if prospect.status in {"replied", "qualified", "converted"} or prospect.last_reply:
+        failures.append("reply or conversion stop state prohibits outreach")
     if not touch.idempotency_key or not touch.idempotency_key.strip(): failures.append("delivery idempotency key is missing")
+    if not touch.message or not touch.message.strip(): failures.append("persisted delivery message is empty")
+    if not authorized_by.strip(): failures.append("authorized_by is required")
+    if confirmation != "EXECUTE ONE CANARY DELIVERY": failures.append("confirmation phrase is invalid")
+    if touch.idempotency_key and db.scalar(select(Touch.id).where(
+        Touch.idempotency_key == touch.idempotency_key,
+        (Touch.sent_at.is_not(None)) | (Touch.execution_status == "sent"),
+    )) is not None:
+        failures.append("a successful send already exists for the idempotency key")
+    if touch.idempotency_key and db.scalar(select(Touch.id).where(
+        Touch.idempotency_key == touch.idempotency_key,
+        Touch.execution_status == "sending",
+    )) is not None:
+        failures.append("another execution is already in flight")
+    if check_provider:
+        if not EMAIL_FROM: failures.append("approved sender identity is not configured")
+    failures = list(dict.fromkeys(failures))
     return DeliveryEligibility(eligible=not failures, failures=failures)
+
+
+def add_canary_audit(db: Session, touch: Touch, authorized_by: str, result: str,
+                     failure: str | None = None, provider_message_id: str | None = None) -> None:
+    campaign, prospect = touch.campaign, touch.campaign.prospect
+    db.add(CanaryExecutionAudit(
+        campaign_id=campaign.id, delivery_id=touch.id, prospect_id=prospect.id,
+        authorized_by=authorized_by.strip(), authorization_timestamp=campaign.live_authorized_at,
+        execution_requested_at=utcnow(), sender_identity=EMAIL_FROM,
+        recipient_email=prospect.verified_email or "", idempotency_key=touch.idempotency_key or "",
+        provider_name=EMAIL_PROVIDER_NAME, provider_message_id=provider_message_id,
+        result=result, failure_reason=failure,
+    ))
 
 
 @app.get("/health")
@@ -594,6 +658,147 @@ def inspect_campaign_safety(campaign_id: int, db: Session = Depends(db_session))
         "eligible_delivery_count": sum(item.eligible for item in eligible),
         "safety_failures": failures,
     }
+
+
+@app.get("/deliveries/{delivery_id}/canary-preflight", response_model=DeliveryEligibility,
+         dependencies=[Depends(require_auth)], summary="Read canary eligibility without changing state.")
+def canary_preflight(delivery_id: int, db: Session = Depends(db_session)):
+    touch = db.get(Touch, delivery_id)
+    if not touch:
+        raise HTTPException(404, "Delivery not found")
+    return can_execute_delivery(touch, touch.campaign, touch.campaign.prospect, db,
+                                check_provider=True)
+
+
+@app.get("/deliveries/{delivery_id}/execution", dependencies=[Depends(require_auth)],
+         summary="Inspect persisted canary execution state without executing.")
+def inspect_delivery_execution(delivery_id: int, db: Session = Depends(db_session)):
+    touch = db.get(Touch, delivery_id)
+    if not touch:
+        raise HTTPException(404, "Delivery not found")
+    prospect = touch.campaign.prospect
+    return {
+        "delivery_id": touch.id, "campaign_id": touch.campaign_id,
+        "prospect_id": prospect.id, "execution_status": touch.execution_status,
+        "attempt_count": touch.execution_attempt_count, "sent_at": touch.sent_at,
+        "provider": touch.provider_name, "provider_message_id": touch.provider_message_id,
+        "idempotency_key": touch.idempotency_key, "sender": EMAIL_FROM or None,
+        "recipient": prospect.verified_email, "last_execution_error": touch.last_execution_error,
+    }
+
+
+@app.post("/campaigns/{campaign_id}/canary-execute", dependencies=[Depends(require_auth)],
+          summary="Explicitly attempt no more than one persisted email delivery.")
+def canary_execute(campaign_id: int, body: CanaryExecutionIn, db: Session = Depends(db_session)):
+    """Claim exactly one explicitly named delivery; never enumerate campaign deliveries."""
+    campaign = db.get(Campaign, campaign_id)
+    if not campaign:
+        return JSONResponse(status_code=409, content={
+            "detail": "Canary execution blocked by safety checks", "failures": ["campaign does not exist"],
+        })
+    touch = db.get(Touch, body.delivery_id)
+    if not touch:
+        return JSONResponse(status_code=409, content={
+            "detail": "Canary execution blocked by safety checks", "failures": ["delivery does not exist"],
+        })
+    if touch.campaign_id != campaign.id:
+        return JSONResponse(status_code=409, content={
+            "detail": "Canary execution blocked by safety checks",
+            "failures": ["delivery does not belong to the specified campaign"],
+        })
+
+    # A retry after confirmed success is an idempotent read and never reaches a provider.
+    if touch.sent_at is not None or touch.execution_status == "sent":
+        return {"delivery_id": touch.id, "execution_status": "sent", "already_executed": True,
+                "provider_message_id": touch.provider_message_id}
+
+    eligibility = can_execute_delivery(
+        touch, campaign, campaign.prospect, db, authorized_by=body.authorized_by,
+        confirmation=body.confirmation, check_provider=True,
+    )
+    if not eligibility.eligible:
+        add_canary_audit(db, touch, body.authorized_by, "blocked", "; ".join(eligibility.failures))
+        db.commit()
+        return JSONResponse(status_code=409, content={
+            "detail": "Canary execution blocked by safety checks", "failures": eligibility.failures,
+        })
+
+    if EMAIL_PROVIDER_NAME not in {"mock", "webhook"}:
+        add_canary_audit(db, touch, body.authorized_by, "failed", "email delivery provider is not configured")
+        db.commit()
+        raise HTTPException(503, "No email delivery provider is configured; no email was sent")
+    try:
+        provider = configured_provider(EMAIL_PROVIDER_NAME, DELIVERY_WEBHOOK)
+    except ValueError as exc:
+        add_canary_audit(db, touch, body.authorized_by, "failed", str(exc))
+        db.commit()
+        raise HTTPException(503, f"Email provider configuration is incomplete: {exc}")
+
+    started = utcnow()
+    # Atomic compare-and-set is PostgreSQL safe and also makes concurrent test requests safe.
+    claimed = db.execute(update(Touch).where(
+        Touch.id == touch.id, Touch.sent_at.is_(None),
+        Touch.execution_status.not_in(("sending", "sent")),
+    ).values(
+        execution_status="sending", execution_started_at=started,
+        execution_completed_at=None, last_execution_error=None,
+        execution_attempt_count=Touch.execution_attempt_count + 1,
+        provider_name=provider.name,
+    )).rowcount
+    db.commit()
+    if claimed != 1:
+        db.refresh(touch)
+        if touch.sent_at is not None or touch.execution_status == "sent":
+            return {"delivery_id": touch.id, "execution_status": "sent", "already_executed": True,
+                    "provider_message_id": touch.provider_message_id}
+        return JSONResponse(status_code=409, content={
+            "detail": "Canary execution blocked by safety checks",
+            "failures": ["another execution is already in flight"],
+        })
+
+    # Re-load and re-check all mutable stop state immediately before the sole provider call.
+    db.expire_all()
+    touch = db.get(Touch, body.delivery_id)
+    final_check = can_execute_delivery(
+        touch, touch.campaign, touch.campaign.prospect, db,
+        authorized_by=body.authorized_by, confirmation=body.confirmation,
+    )
+    final_failures = [reason for reason in final_check.failures
+                      if reason != "another execution is already in flight"]
+    if final_failures:
+        touch.execution_status = "blocked"
+        touch.execution_completed_at = utcnow()
+        touch.last_execution_error = "; ".join(final_failures)
+        add_canary_audit(db, touch, body.authorized_by, "blocked", touch.last_execution_error)
+        db.commit()
+        return JSONResponse(status_code=409, content={
+            "detail": "Canary execution blocked by safety checks", "failures": final_failures,
+        })
+
+    try:
+        result = provider.send(
+            sender=EMAIL_FROM, recipient=touch.campaign.prospect.verified_email,
+            message=touch.message, idempotency_key=touch.idempotency_key,
+        )
+    except Exception as exc:
+        safe_error = f"{type(exc).__name__}: email provider call failed"[:500]
+        touch.execution_status = "failed"
+        touch.execution_completed_at = utcnow()
+        touch.last_execution_error = safe_error
+        add_canary_audit(db, touch, body.authorized_by, "failed", safe_error)
+        db.commit()
+        raise HTTPException(502, "Email provider call failed; no send was confirmed")
+
+    completed = utcnow()
+    touch.status, touch.sent_at, touch.execution_status = "sent", completed, "sent"
+    touch.execution_completed_at = completed
+    touch.provider_message_id = result.message_id
+    touch.last_execution_error = None
+    add_canary_audit(db, touch, body.authorized_by, "sent", provider_message_id=result.message_id)
+    db.commit()
+    return {"delivery_id": touch.id, "execution_status": "sent", "already_executed": False,
+            "sent_at": touch.sent_at, "provider": provider.name,
+            "provider_message_id": touch.provider_message_id}
 
 
 @app.post("/prospects/{prospect_id}/campaigns", status_code=201, dependencies=[Depends(require_auth)])
