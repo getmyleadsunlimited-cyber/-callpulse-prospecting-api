@@ -9,7 +9,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -43,6 +43,7 @@ INSURANCE_INDUSTRIES = ("Final Expense", "Auto Insurance")
 INDUSTRIES = GENERAL_INDUSTRIES + INSURANCE_INDUSTRIES
 MIN_QUALIFICATION_SCORE = 65
 DEFAULT_LOCATION = "Houston, TX"
+DEFAULT_WORKSPACE_ID = "callpulse-direct"
 
 OPENING_MESSAGE_HELPERS = {
     "Roofing": "CallPulse AI Website Lead Recovery engages inspection and replacement visitors who leave your website without calling or requesting an estimate.",
@@ -70,6 +71,7 @@ class Base(DeclarativeBase):
 
 class Prospect(Base):
     __tablename__ = "prospects"
+    __table_args__ = (UniqueConstraint("workspace_id", "verified_email", name="uq_prospect_workspace_email"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     company_name: Mapped[str] = mapped_column(String(200))
     website: Mapped[str] = mapped_column(String(500))
@@ -80,7 +82,8 @@ class Prospect(Base):
     ai_recovery_opportunity: Mapped[str] = mapped_column(Text)
     decision_maker_name: Mapped[str | None] = mapped_column(String(200))
     decision_maker_title: Mapped[str | None] = mapped_column(String(200))
-    verified_email: Mapped[str | None] = mapped_column(String(320), unique=True)
+    workspace_id: Mapped[str] = mapped_column(String(100), default=DEFAULT_WORKSPACE_ID, index=True)
+    verified_email: Mapped[str | None] = mapped_column(String(320))
     email_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     opening_message: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(40), default="researched", index=True)
@@ -138,6 +141,7 @@ class Touch(Base):
 class Suppression(Base):
     __tablename__ = "suppressions"
     email: Mapped[str] = mapped_column(String(320), primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(String(100), primary_key=True, default=DEFAULT_WORKSPACE_ID)
     reason: Mapped[str] = mapped_column(String(200))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
@@ -179,6 +183,34 @@ def require_auth(credentials: HTTPAuthorizationCredentials | None = Depends(bear
         or not hmac.compare_digest(credentials.credentials, API_KEY)
     ):
         raise HTTPException(401, "Valid bearer authentication is required")
+
+
+def workspace_context(x_workspace_id: str | None = Header(
+    default=None, alias="X-Workspace-ID",
+    description="Tenant workspace. Omit only for the CallPulse Direct account.",
+)) -> str:
+    """Resolve tenant context while retaining the legacy Direct-account default."""
+    if x_workspace_id is None:
+        return DEFAULT_WORKSPACE_ID
+    workspace_id = x_workspace_id.strip()
+    if not workspace_id or len(workspace_id) > 100 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", workspace_id):
+        raise HTTPException(400, "X-Workspace-ID is invalid")
+    return workspace_id
+
+
+def scoped_prospect(db: Session, prospect_id: int, workspace_id: str) -> Prospect | None:
+    return db.scalar(select(Prospect).where(Prospect.id == prospect_id, Prospect.workspace_id == workspace_id))
+
+
+def scoped_campaign(db: Session, campaign_id: int, workspace_id: str) -> Campaign | None:
+    return db.scalar(select(Campaign).where(
+        Campaign.id == campaign_id, Campaign.prospect.has(Prospect.workspace_id == workspace_id)))
+
+
+def scoped_touch(db: Session, delivery_id: int, workspace_id: str) -> Touch | None:
+    return db.scalar(select(Touch).where(
+        Touch.id == delivery_id,
+        Touch.campaign.has(Campaign.prospect.has(Prospect.workspace_id == workspace_id))))
 
 
 def utcnow() -> datetime:
@@ -349,7 +381,7 @@ def delivery_inspection(t: Touch) -> dict:
 
 def prospect_suppressed(prospect: Prospect, db: Session) -> bool:
     return prospect.status == "suppressed" or bool(
-        prospect.verified_email and db.get(Suppression, prospect.verified_email)
+        prospect.verified_email and db.get(Suppression, (prospect.verified_email, prospect.workspace_id))
     )
 
 
@@ -587,10 +619,10 @@ def industry_buttons():
 
 
 @app.post("/prospects", status_code=201, dependencies=[Depends(require_auth)])
-def create_prospect(body: ProspectIn, db: Session = Depends(db_session)):
+def create_prospect(body: ProspectIn, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
     if not body.email_verified:
         raise HTTPException(422, "Only independently verified email addresses qualify")
-    p = Prospect(**body.model_dump())
+    p = Prospect(workspace_id=workspace_id, **body.model_dump())
     db.add(p)
     try:
         db.commit()
@@ -602,8 +634,9 @@ def create_prospect(body: ProspectIn, db: Session = Depends(db_session)):
 
 @app.get("/prospects", dependencies=[Depends(require_auth)])
 def list_prospects(status: str | None = None, industry: str | None = None,
-                   limit: int = Query(25, ge=1, le=100), db: Session = Depends(db_session)):
-    query = select(Prospect)
+                   limit: int = Query(25, ge=1, le=100), workspace_id: str = Depends(workspace_context),
+                   db: Session = Depends(db_session)):
+    query = select(Prospect).where(Prospect.workspace_id == workspace_id)
     if status:
         query = query.where(Prospect.status == status)
     if industry:
@@ -613,8 +646,8 @@ def list_prospects(status: str | None = None, industry: str | None = None,
 
 @app.get("/prospects/{prospect_id}/campaigns", response_model=list[CampaignInspection],
          dependencies=[Depends(require_auth)], summary="Inspect a prospect's campaigns without changing state.")
-def inspect_prospect_campaigns(prospect_id: int, db: Session = Depends(db_session)):
-    prospect = db.get(Prospect, prospect_id)
+def inspect_prospect_campaigns(prospect_id: int, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
+    prospect = scoped_prospect(db, prospect_id, workspace_id)
     if not prospect:
         raise HTTPException(404, "Prospect not found")
     return [campaign_inspection(c) for c in sorted(prospect.campaigns, key=lambda campaign: campaign.id)]
@@ -622,8 +655,8 @@ def inspect_prospect_campaigns(prospect_id: int, db: Session = Depends(db_sessio
 
 @app.get("/campaigns/{campaign_id}/deliveries", response_model=list[DeliveryInspection],
          dependencies=[Depends(require_auth)], summary="Inspect campaign deliveries without running them.")
-def inspect_campaign_deliveries(campaign_id: int, db: Session = Depends(db_session)):
-    campaign = db.get(Campaign, campaign_id)
+def inspect_campaign_deliveries(campaign_id: int, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
+    campaign = scoped_campaign(db, campaign_id, workspace_id)
     if not campaign:
         raise HTTPException(404, "Campaign not found")
     return [delivery_inspection(t) for t in sorted(campaign.touches, key=lambda touch: touch.day)]
@@ -645,8 +678,8 @@ def authorization_failures(campaign: Campaign, body: LiveAuthorizationIn, db: Se
 
 @app.post("/campaigns/{campaign_id}/authorize-live", dependencies=[Depends(require_auth)],
           summary="Explicitly authorize a campaign for future live execution.")
-def authorize_live(campaign_id: int, body: LiveAuthorizationIn, db: Session = Depends(db_session)):
-    campaign = db.get(Campaign, campaign_id)
+def authorize_live(campaign_id: int, body: LiveAuthorizationIn, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
+    campaign = scoped_campaign(db, campaign_id, workspace_id)
     if not campaign:
         raise HTTPException(404, "Campaign not found")
     failures = authorization_failures(campaign, body, db)
@@ -674,8 +707,8 @@ def authorize_live(campaign_id: int, body: LiveAuthorizationIn, db: Session = De
 
 @app.get("/campaigns/{campaign_id}/safety", dependencies=[Depends(require_auth)],
          summary="Inspect live-execution safety without changing state.")
-def inspect_campaign_safety(campaign_id: int, db: Session = Depends(db_session)):
-    campaign = db.get(Campaign, campaign_id)
+def inspect_campaign_safety(campaign_id: int, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
+    campaign = scoped_campaign(db, campaign_id, workspace_id)
     if not campaign:
         raise HTTPException(404, "Campaign not found")
     prospect = campaign.prospect
@@ -699,8 +732,8 @@ def inspect_campaign_safety(campaign_id: int, db: Session = Depends(db_session))
 
 @app.get("/deliveries/{delivery_id}/canary-preflight", response_model=DeliveryEligibility,
          dependencies=[Depends(require_auth)], summary="Read canary eligibility without changing state.")
-def canary_preflight(delivery_id: int, db: Session = Depends(db_session)):
-    touch = db.get(Touch, delivery_id)
+def canary_preflight(delivery_id: int, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
+    touch = scoped_touch(db, delivery_id, workspace_id)
     if not touch:
         raise HTTPException(404, "Delivery not found")
     return can_execute_delivery(touch, touch.campaign, touch.campaign.prospect, db,
@@ -709,8 +742,8 @@ def canary_preflight(delivery_id: int, db: Session = Depends(db_session)):
 
 @app.get("/deliveries/{delivery_id}/execution", dependencies=[Depends(require_auth)],
          summary="Inspect persisted canary execution state without executing.")
-def inspect_delivery_execution(delivery_id: int, db: Session = Depends(db_session)):
-    touch = db.get(Touch, delivery_id)
+def inspect_delivery_execution(delivery_id: int, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
+    touch = scoped_touch(db, delivery_id, workspace_id)
     if not touch:
         raise HTTPException(404, "Delivery not found")
     prospect = touch.campaign.prospect
@@ -727,14 +760,14 @@ def inspect_delivery_execution(delivery_id: int, db: Session = Depends(db_sessio
 
 @app.post("/campaigns/{campaign_id}/canary-execute", dependencies=[Depends(require_auth)],
           summary="Explicitly attempt no more than one persisted email delivery.")
-def canary_execute(campaign_id: int, body: CanaryExecutionIn, db: Session = Depends(db_session)):
+def canary_execute(campaign_id: int, body: CanaryExecutionIn, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
     """Claim exactly one explicitly named delivery; never enumerate campaign deliveries."""
-    campaign = db.get(Campaign, campaign_id)
+    campaign = scoped_campaign(db, campaign_id, workspace_id)
     if not campaign:
         return JSONResponse(status_code=409, content={
             "detail": "Canary execution blocked by safety checks", "failures": ["campaign does not exist"],
         })
-    touch = db.get(Touch, body.delivery_id)
+    touch = scoped_touch(db, body.delivery_id, workspace_id)
     if not touch:
         return JSONResponse(status_code=409, content={
             "detail": "Canary execution blocked by safety checks", "failures": ["delivery does not exist"],
@@ -801,7 +834,7 @@ def canary_execute(campaign_id: int, body: CanaryExecutionIn, db: Session = Depe
 
     # Re-load and re-check all mutable stop state immediately before the sole provider call.
     db.expire_all()
-    touch = db.get(Touch, body.delivery_id)
+    touch = scoped_touch(db, body.delivery_id, workspace_id)
     final_check = can_execute_delivery(
         touch, touch.campaign, touch.campaign.prospect, db,
         authorized_by=body.authorized_by, confirmation=body.confirmation,
@@ -851,15 +884,15 @@ def canary_execute(campaign_id: int, body: CanaryExecutionIn, db: Session = Depe
 
 
 @app.post("/prospects/{prospect_id}/campaigns", status_code=201, dependencies=[Depends(require_auth)])
-def launch_campaign(prospect_id: int, body: CampaignIn, db: Session = Depends(db_session)):
-    p = db.get(Prospect, prospect_id)
+def launch_campaign(prospect_id: int, body: CampaignIn, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
+    p = scoped_prospect(db, prospect_id, workspace_id)
     if not p:
         raise HTTPException(404, "Prospect not found")
     if not p.email_verified or not p.verified_email:
         raise HTTPException(422, "A verified email is required")
     if p.score < MIN_QUALIFICATION_SCORE:
         raise HTTPException(422, f"Qualification score must be at least {MIN_QUALIFICATION_SCORE}")
-    if db.get(Suppression, p.verified_email):
+    if db.get(Suppression, (p.verified_email, p.workspace_id)):
         raise HTTPException(409, "Recipient is suppressed")
     existing = db.scalar(select(Campaign).where(Campaign.prospect_id == p.id))
     if existing:
@@ -885,15 +918,15 @@ def launch_campaign(prospect_id: int, body: CampaignIn, db: Session = Depends(db
 
 
 @app.post("/launcher/run", dependencies=[Depends(require_auth)])
-def run_launcher(now_at: datetime | None = None, db: Session = Depends(db_session)):
+def run_launcher(now_at: datetime | None = None, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
     current = now_at or utcnow()
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
-    due = list(db.scalars(select(Touch).where(Touch.status == "scheduled", Touch.scheduled_at <= current).order_by(Touch.scheduled_at)))
+    due = list(db.scalars(select(Touch).where(Touch.status == "scheduled", Touch.scheduled_at <= current, Touch.campaign.has(Campaign.prospect.has(Prospect.workspace_id == workspace_id))).order_by(Touch.scheduled_at)))
     sent = skipped = failed = 0
     for touch in due:
         p = touch.campaign.prospect
-        if touch.campaign.status != "active" or p.status in {"replied", "qualified", "converted", "suppressed"} or db.get(Suppression, p.verified_email):
+        if touch.campaign.status != "active" or p.status in {"replied", "qualified", "converted", "suppressed"} or db.get(Suppression, (p.verified_email, p.workspace_id)):
             touch.status = "suppressed"
             touch.skipped = True
             touch.cancellation_or_skip_reason = "prospect suppression or campaign stop"
@@ -915,12 +948,12 @@ def run_launcher(now_at: datetime | None = None, db: Session = Depends(db_sessio
 
 
 @app.post("/suppressions", status_code=201, dependencies=[Depends(require_auth)])
-def suppress(body: SuppressionIn, db: Session = Depends(db_session)):
-    item = db.get(Suppression, body.email)
+def suppress(body: SuppressionIn, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
+    item = db.get(Suppression, (body.email, workspace_id))
     if not item:
-        item = Suppression(email=body.email, reason=body.reason)
+        item = Suppression(email=body.email, workspace_id=workspace_id, reason=body.reason)
         db.add(item)
-    for p in db.scalars(select(Prospect).where(Prospect.verified_email == body.email)):
+    for p in db.scalars(select(Prospect).where(Prospect.verified_email == body.email, Prospect.workspace_id == workspace_id)):
         p.status = "suppressed"
         for campaign in p.campaigns:
             campaign.status = "suppressed"
@@ -934,8 +967,8 @@ def suppress(body: SuppressionIn, db: Session = Depends(db_session)):
 
 
 @app.post("/prospects/{prospect_id}/reply", dependencies=[Depends(require_auth)])
-def record_reply(prospect_id: int, body: ReplyIn, db: Session = Depends(db_session)):
-    p = db.get(Prospect, prospect_id)
+def record_reply(prospect_id: int, body: ReplyIn, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
+    p = scoped_prospect(db, prospect_id, workspace_id)
     if not p:
         raise HTTPException(404, "Prospect not found")
     p.last_reply, p.intent = body.reply_text, body.intent
@@ -947,8 +980,8 @@ def record_reply(prospect_id: int, body: ReplyIn, db: Session = Depends(db_sessi
 
 
 @app.post("/prospects/{prospect_id}/conversion", dependencies=[Depends(require_auth)])
-def conversion(prospect_id: int, body: ConversionIn, db: Session = Depends(db_session)):
-    p = db.get(Prospect, prospect_id)
+def conversion(prospect_id: int, body: ConversionIn, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
+    p = scoped_prospect(db, prospect_id, workspace_id)
     if not p:
         raise HTTPException(404, "Prospect not found")
     p.conversion_stage = body.conversion_stage

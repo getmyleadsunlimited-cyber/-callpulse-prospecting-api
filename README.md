@@ -26,6 +26,15 @@ Paste the updated openapi.yaml as the schema.
 Test:
 healthCheck → listIndustryButtons → createProspect → launchSevenDayCampaign → inspectProspectCampaigns → inspectCampaignDeliveries → runDueCampaignTouches → recordReplyAndStopCampaign → recordConversion
 
+### Workspace context
+
+Send `X-Workspace-ID: <client-workspace>` on every prospect, campaign, delivery,
+suppression, runner, reply, and conversion operation performed for an agency
+client. Resource IDs and recipient suppressions are resolved only inside that
+workspace. Omitting the header selects the legacy `callpulse-direct` workspace
+and is supported only for backward-compatible CallPulse Direct integrations;
+agency/client integrations must always send their client's workspace ID.
+
 ## Production campaign
 
 The service supports the business verticals exposed at `/launcher` and qualifies only prospects scoring at least 65 with independently verified business emails. Selecting a vertical supplies its CallPulse AI Website Lead Recovery opening angle. Launching a campaign creates exactly three idempotent touches for Day 0, Day 3, and Day 6 and closes the seven-day campaign on Day 7. Replies, conversions, opt-outs, hard-bounce suppressions, and other suppressions immediately stop further outreach.

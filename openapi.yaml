@@ -39,12 +39,14 @@ paths:
     get:
       operationId: listProspects
       parameters:
+        - {$ref: '#/components/parameters/workspaceId'}
         - {in: query, name: status, schema: {type: string}}
         - {in: query, name: industry, schema: {$ref: '#/components/schemas/Industry'}}
         - {in: query, name: limit, schema: {type: integer, minimum: 1, maximum: 100, default: 25}}
       responses: {'200': {description: Prospect list}, '401': {description: Unauthorized}}
     post:
       operationId: createProspect
+      parameters: [{$ref: '#/components/parameters/workspaceId'}]
       requestBody:
         required: true
         content: {application/json: {schema: {$ref: '#/components/schemas/Prospect'}}}
@@ -53,7 +55,7 @@ paths:
     get:
       operationId: inspectProspectCampaigns
       summary: Read all persisted campaign scheduling and sequence state for a prospect.
-      parameters: [{$ref: '#/components/parameters/prospectId'}]
+      parameters: [{$ref: '#/components/parameters/prospectId'}, {$ref: '#/components/parameters/workspaceId'}]
       responses:
         '200':
           description: Campaign inspection results with persisted dry-run and authorization state
@@ -64,7 +66,7 @@ paths:
         '404': {description: Prospect not found}
     post:
       operationId: launchSevenDayCampaign
-      parameters: [{$ref: '#/components/parameters/prospectId'}]
+      parameters: [{$ref: '#/components/parameters/prospectId'}, {$ref: '#/components/parameters/workspaceId'}]
       requestBody:
         required: true
         content:
@@ -81,6 +83,7 @@ paths:
       operationId: inspectCampaignDeliveries
       summary: Read persisted delivery/touch scheduling state without triggering delivery.
       parameters:
+        - {$ref: '#/components/parameters/workspaceId'}
         - {in: path, name: campaign_id, required: true, schema: {type: integer}}
       responses:
         '200':
@@ -94,7 +97,7 @@ paths:
     post:
       operationId: authorizeCampaignLive
       summary: Explicitly authorize a campaign for future live execution after safety checks.
-      parameters: [{$ref: '#/components/parameters/campaignId'}]
+      parameters: [{$ref: '#/components/parameters/campaignId'}, {$ref: '#/components/parameters/workspaceId'}]
       requestBody:
         required: true
         content:
@@ -112,7 +115,7 @@ paths:
     get:
       operationId: inspectCampaignSafety
       summary: Read live authorization, suppression, destination, and delivery eligibility state.
-      parameters: [{$ref: '#/components/parameters/campaignId'}]
+      parameters: [{$ref: '#/components/parameters/campaignId'}, {$ref: '#/components/parameters/workspaceId'}]
       responses:
         '200': {description: Read-only campaign safety state}
         '404': {description: Campaign not found}
@@ -120,7 +123,7 @@ paths:
     post:
       operationId: executeOneCanaryDelivery
       summary: Explicitly attempt at most one persisted email delivery.
-      parameters: [{$ref: '#/components/parameters/campaignId'}]
+      parameters: [{$ref: '#/components/parameters/campaignId'}, {$ref: '#/components/parameters/workspaceId'}]
       requestBody:
         required: true
         content:
@@ -140,7 +143,7 @@ paths:
     get:
       operationId: inspectDeliveryExecution
       summary: Read non-secret persisted canary execution state; never execute.
-      parameters: [{$ref: '#/components/parameters/deliveryId'}]
+      parameters: [{$ref: '#/components/parameters/deliveryId'}, {$ref: '#/components/parameters/workspaceId'}]
       responses:
         '200': {description: Persisted execution state}
         '404': {description: Delivery not found}
@@ -148,7 +151,7 @@ paths:
     get:
       operationId: preflightCanaryDelivery
       summary: Evaluate current canary eligibility without changing state.
-      parameters: [{$ref: '#/components/parameters/deliveryId'}]
+      parameters: [{$ref: '#/components/parameters/deliveryId'}, {$ref: '#/components/parameters/workspaceId'}]
       responses:
         '200': {description: Structured eligibility decision and all failures}
         '404': {description: Delivery not found}
@@ -156,11 +159,13 @@ paths:
     post:
       operationId: runDueCampaignTouches
       parameters:
+        - {$ref: '#/components/parameters/workspaceId'}
         - {in: query, name: now_at, schema: {type: [string, 'null'], format: date-time}}
       responses: {'200': {description: Due-touch results}}
   /suppressions:
     post:
       operationId: suppressEmail
+      parameters: [{$ref: '#/components/parameters/workspaceId'}]
       requestBody:
         required: true
         content:
@@ -173,7 +178,7 @@ paths:
   /prospects/{prospect_id}/reply:
     post:
       operationId: recordReplyAndStopCampaign
-      parameters: [{$ref: '#/components/parameters/prospectId'}]
+      parameters: [{$ref: '#/components/parameters/prospectId'}, {$ref: '#/components/parameters/workspaceId'}]
       requestBody:
         required: true
         content:
@@ -186,7 +191,7 @@ paths:
   /prospects/{prospect_id}/conversion:
     post:
       operationId: recordConversion
-      parameters: [{$ref: '#/components/parameters/prospectId'}]
+      parameters: [{$ref: '#/components/parameters/prospectId'}, {$ref: '#/components/parameters/workspaceId'}]
       requestBody:
         required: true
         content:
@@ -204,6 +209,12 @@ components:
     prospectId: {in: path, name: prospect_id, required: true, schema: {type: integer}}
     campaignId: {in: path, name: campaign_id, required: true, schema: {type: integer}}
     deliveryId: {in: path, name: delivery_id, required: true, schema: {type: integer}}
+    workspaceId:
+      in: header
+      name: X-Workspace-ID
+      required: false
+      description: Tenant workspace. Omit only for the backward-compatible CallPulse Direct account.
+      schema: {type: string, default: callpulse-direct}
   schemas:
     CampaignSequenceState:
       type: object
