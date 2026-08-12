@@ -1,9 +1,11 @@
 import importlib
+import io
 import json
 import re
 import subprocess
 import threading
 import urllib.error
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -652,3 +654,70 @@ def test_microsoft_graph_auth_and_rate_limit_fail_safely_without_retry(monkeypat
         provider.send(sender="approved@example.com", recipient="recipient@example.com",
                       subject="subject", message="body", idempotency_key="key")
     assert calls == 1
+
+
+def test_graph_auth_diagnostic_redacts_raw_and_encoded_client_secret(monkeypatch):
+    import email_providers
+    secret = "p@ss word&plus+equals=value/%"
+    encoded = urllib.parse.quote_plus(secret, safe="")
+    payload = json.dumps({
+        "error": "invalid_client",
+        "error_description": (
+            f"AADSTS7000215: Invalid client secret {secret}; submitted as {encoded}. "
+            "Trace ID: safe-trace"
+        ),
+    }).encode()
+
+    def auth_failure(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, io.BytesIO(payload))
+
+    email_providers.MicrosoftGraphEmailProvider._token_cache.clear()
+    monkeypatch.setattr(email_providers.urllib.request, "urlopen", auth_failure)
+    provider = email_providers.MicrosoftGraphEmailProvider("tenant", "client", secret)
+    with pytest.raises(email_providers.EmailProviderError) as raised:
+        provider.send(sender="approved@example.com", recipient="recipient@example.com",
+                      subject="subject", message="body", idempotency_key="key")
+    diagnostic = str(raised.value)
+    assert "HTTP 401" in diagnostic
+    assert "invalid_client" in diagnostic
+    assert "AADSTS7000215: Invalid client secret" in diagnostic
+    assert secret not in diagnostic and encoded not in diagnostic
+
+
+def test_graph_auth_secret_never_reaches_execution_state_logs_or_audit(client, monkeypatch, caplog):
+    import app
+    import email_providers
+    secret = "form secret&next=unsafe+value/%"
+    encoded_variants = {urllib.parse.quote(secret, safe=""),
+                        urllib.parse.quote_plus(secret, safe="")}
+    description = (f"AADSTS7000215: Invalid client secret {secret}; form value "
+                   f"{urllib.parse.quote_plus(secret, safe='')}. Trace ID: safe-trace")
+    payload = json.dumps({"error": "invalid_client", "error_description": description}).encode()
+
+    def auth_failure(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, io.BytesIO(payload))
+
+    email_providers.MicrosoftGraphEmailProvider._token_cache.clear()
+    monkeypatch.setattr(email_providers.urllib.request, "urlopen", auth_failure)
+    monkeypatch.setattr(app, "EMAIL_PROVIDER_NAME", "microsoft_graph")
+    monkeypatch.setattr(app, "EMAIL_FROM", "approved@example.com")
+    monkeypatch.setattr(app, "MICROSOFT_TENANT_ID", "tenant")
+    monkeypatch.setattr(app, "MICROSOFT_CLIENT_ID", "client")
+    monkeypatch.setattr(app, "MICROSOFT_CLIENT_SECRET", secret)
+    _, campaign = launch(client, "redaction@example.com",
+                         datetime.now(timezone.utc) - timedelta(minutes=1))
+    assert authorize(client, campaign["id"]).status_code == 200
+    response = execute_canary(client, campaign)
+    assert response.status_code == 502
+    state = client.get(f"/deliveries/{campaign['touches'][0]['id']}/execution",
+                       headers=headers()).json()
+    with app.SessionLocal() as db:
+        audit = db.query(app.CanaryExecutionAudit).filter_by(
+            delivery_id=campaign["touches"][0]["id"]).order_by(
+                app.CanaryExecutionAudit.id.desc()).first()
+        retained = state["last_execution_error"] + audit.failure_reason
+    observable = retained + response.text + caplog.text
+    assert "HTTP 401" in retained and "invalid_client" in retained
+    assert "AADSTS7000215: Invalid client secret" in retained
+    assert secret not in observable
+    assert all(encoded not in observable for encoded in encoded_variants)
