@@ -34,9 +34,19 @@ The service supports the business verticals exposed at `/launcher` and qualifies
 
 Both inspection routes require the same `Authorization: Bearer <CALLPULSE_ACTIONS_API_KEY>` header as the write routes. `GET /prospects/{prospect_id}/campaigns` returns campaign identity, prospect and industry, status, start/end timestamps, current Day 0/3/6 sequence state, stopped state, and the current process dry-run setting. `GET /campaigns/{campaign_id}/deliveries` returns the persisted touches in sequence order with IDs, scheduling, full message, delivery status, sent timestamp, derived skipped/cancelled flags, and the opaque idempotency key. They perform reads only: neither route launches the runner, sends a message, nor commits a database transaction. A missing parent resource returns `404`.
 
-The existing schema does **not** persist a campaign creation timestamp separate from `starts_at`, a per-campaign or per-touch dry-run snapshot, a stop reason, or a touch cancellation/skip reason. Accordingly, inspection reports `starts_at` (not an invented creation time), exposes `dry_run` as the current `CALLPULSE_DRY_RUN` process setting, and returns unavailable reason fields as `null`. A persisted touch status of `simulated` is the durable evidence that a touch was processed in dry-run mode. `stopped`, `skipped`, and `cancelled` are booleans derived only from persisted status values. No API keys, delivery-provider credentials, database URLs, or access tokens are included.
+The schema persists campaign and delivery dry-run state, explicit live authorization audit fields, stable delivery idempotency keys, and delivery cancellation/skip reasons. Inspection responses never include API keys, delivery-provider credentials, database URLs, or access tokens.
 
-Set `DATABASE_URL` to PostgreSQL. Render runs `python migrate.py` before every API start, applying each pending SQL migration transactionally and checking every SQLAlchemy model table and column before serving traffic. Set a strong `CALLPULSE_ACTIONS_API_KEY`; authentication fails closed when it is missing. The launcher is safe by default (`CALLPULSE_DRY_RUN=true`). After configuring and validating an HTTPS `CALLPULSE_DELIVERY_WEBHOOK`, explicitly set dry-run to `false` and schedule `python launcher.py` from a trusted cron with `CALLPULSE_API_URL` and the API key. The adapter receives `to`, `message`, and `idempotency_key`; failed deliveries remain scheduled for retry.
+## Live Execution Safety Gate
+
+Every new campaign and delivery starts in dry-run mode and is not live authorized:
+
+**Dry Run → Safety Checks → Explicit Authorization → Eligible for Future Execution**
+
+An authenticated operator must call `POST /campaigns/{campaign_id}/authorize-live` with a non-blank `authorized_by` and the exact confirmation `AUTHORIZE LIVE OUTREACH`. The API checks active campaign state, prospect suppression, a verified valid destination, deliveries, and stable idempotency keys before atomically recording who authorized the campaign and when. It then transitions only future, unsent, non-skipped, non-cancelled deliveries out of dry-run mode. Repeating the same authorization is idempotent and does not recreate deliveries, change timing, or replace idempotency keys.
+
+`GET /campaigns/{campaign_id}/safety` provides a read-only safety and eligibility summary. A later suppression remains an absolute stop: future deliveries are skipped with a persisted suppression reason while sent history is retained. **Authorization only establishes eligibility for a future executor; it does not send email, SMS, calls, or social messages.** This API does not invoke a messaging provider as part of authorization or safety inspection.
+
+Set `DATABASE_URL` to PostgreSQL. Render runs `python migrate.py` before every API start, applying each pending SQL migration transactionally and checking every SQLAlchemy model table and column before serving traffic. Set a strong `CALLPULSE_ACTIONS_API_KEY`; authentication fails closed when it is missing. New campaigns are safe by default regardless of process configuration. No messaging-provider setup is part of this safety-gate release.
 
 ## Development
 

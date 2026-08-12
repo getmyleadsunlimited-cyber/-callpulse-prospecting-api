@@ -64,6 +64,8 @@ def test_openapi_uses_http_bearer_security_for_protected_endpoints(client):
         ("/prospects/{prospect_id}/campaigns", "post"),
         ("/prospects/{prospect_id}/campaigns", "get"),
         ("/campaigns/{campaign_id}/deliveries", "get"),
+        ("/campaigns/{campaign_id}/authorize-live", "post"),
+        ("/campaigns/{campaign_id}/safety", "get"),
         ("/launcher/run", "post"),
         ("/suppressions", "post"),
         ("/prospects/{prospect_id}/reply", "post"),
@@ -285,12 +287,16 @@ def test_inspection_fields_match_the_existing_persisted_campaign_schema(client):
 
     campaign_columns = {column.name for column in app.Campaign.__table__.columns}
     touch_columns = {column.name for column in app.Touch.__table__.columns}
-    assert campaign_columns == {"id", "prospect_id", "status", "starts_at", "ends_at"}
+    assert campaign_columns == {
+        "id", "prospect_id", "status", "starts_at", "ends_at", "dry_run",
+        "live_authorized", "live_authorized_at", "live_authorized_by",
+    }
     assert touch_columns == {
         "id", "campaign_id", "day", "scheduled_at", "status", "message", "idempotency_key", "sent_at",
+        "dry_run", "skipped", "cancelled", "cancellation_or_skip_reason",
     }
-    assert {"created_at", "dry_run", "stop_reason"}.isdisjoint(campaign_columns)
-    assert {"dry_run", "cancelled", "cancellation_reason", "skip_reason"}.isdisjoint(touch_columns)
+    assert {"created_at", "stop_reason"}.isdisjoint(campaign_columns)
+    assert {"cancellation_reason", "skip_reason"}.isdisjoint(touch_columns)
 
 
 def test_render_start_applies_idempotent_location_migration_with_dry_run_enabled():
@@ -301,3 +307,91 @@ def test_render_start_applies_idempotent_location_migration_with_dry_run_enabled
     assert "- key: CALLPULSE_DRY_RUN\n        value: true" in render_config
     assert "ADD COLUMN IF NOT EXISTS location" in location_migration
     assert "DROP TABLE" not in location_migration.upper()
+
+
+def launch(client, email="live@example.com", start=None):
+    created = client.post("/prospects", json=prospect(email), headers=headers()).json()
+    response = client.post(
+        f"/prospects/{created['id']}/campaigns",
+        json={"idempotency_key": f"launch-{email}", "start_at": (start or datetime.now(timezone.utc)).isoformat()},
+        headers=headers(),
+    )
+    assert response.status_code == 201
+    return created, response.json()
+
+
+def authorize(client, campaign_id, authorized_by="safety officer", confirmation="AUTHORIZE LIVE OUTREACH"):
+    return client.post(
+        f"/campaigns/{campaign_id}/authorize-live",
+        json={"authorized_by": authorized_by, "confirmation": confirmation}, headers=headers(),
+    )
+
+
+def test_campaign_defaults_safe_and_authorization_validates_confirmation_and_actor(client):
+    _, campaign = launch(client)
+    assert campaign["dry_run"] is True
+    assert campaign["live_authorized"] is False
+    assert authorize(client, campaign["id"], confirmation="authorize live outreach").status_code == 409
+    assert authorize(client, campaign["id"], authorized_by="   ").status_code == 409
+    safety = client.get(f"/campaigns/{campaign['id']}/safety", headers=headers()).json()
+    assert safety["dry_run"] is True and safety["live_authorized"] is False
+
+
+def test_suppressed_prospect_cannot_be_authorized(client):
+    prospect_row, campaign = launch(client, "suppressed-live@example.com")
+    client.post("/suppressions", json={"email": prospect_row["verified_email"], "reason": "opt-out"}, headers=headers())
+    response = authorize(client, campaign["id"])
+    assert response.status_code == 409
+    assert "prospect is suppressed" in response.json()["failures"]
+
+
+def test_authorization_is_idempotent_preserves_deliveries_keys_and_never_sends(client, monkeypatch):
+    import app
+
+    _, campaign = launch(client, "authorized@example.com", datetime.now(timezone.utc) + timedelta(days=1))
+    before = client.get(f"/campaigns/{campaign['id']}/deliveries", headers=headers()).json()
+    monkeypatch.setattr(app, "deliver", lambda *args: pytest.fail("external delivery must not be called"))
+    first = authorize(client, campaign["id"])
+    second = authorize(client, campaign["id"])
+    assert first.status_code == second.status_code == 200
+    assert first.json()["dry_run"] is False and first.json()["live_authorized"] is True
+    assert first.json()["live_authorized_at"] == second.json()["live_authorized_at"]
+    after = client.get(f"/campaigns/{campaign['id']}/deliveries", headers=headers()).json()
+    assert len(before) == len(after) == 3
+    assert [item["idempotency_key"] for item in before] == [item["idempotency_key"] for item in after]
+    assert all(not item["dry_run"] for item in after)
+
+
+def test_later_suppression_blocks_eligibility_and_preserves_sent_history(client):
+    import app
+
+    p, campaign = launch(client, "later-suppressed@example.com", datetime.now(timezone.utc) - timedelta(days=1))
+    # Preserve a historical sent record; suppression must only mutate future unsent rows.
+    with app.SessionLocal() as db:
+        row = db.get(app.Campaign, campaign["id"])
+        row.touches[0].status = "sent"
+        row.touches[0].sent_at = datetime.now(timezone.utc)
+        db.commit()
+    authorize(client, campaign["id"])
+    client.post("/suppressions", json={"email": p["verified_email"], "reason": "customer opt-out"}, headers=headers())
+    deliveries = client.get(f"/campaigns/{campaign['id']}/deliveries", headers=headers()).json()
+    assert deliveries[0]["status"] == "sent" and deliveries[0]["sent_at"] is not None
+    assert all(item["skipped"] for item in deliveries[1:])
+    assert all("suppression" in item["cancellation_or_skip_reason"] for item in deliveries[1:])
+    safety = client.get(f"/campaigns/{campaign['id']}/safety", headers=headers()).json()
+    assert safety["suppressed"] is True and safety["eligible_delivery_count"] == 0
+
+
+def test_safety_inspection_is_read_only(client):
+    import app
+
+    _, campaign = launch(client, "readonly-safety@example.com")
+    with app.engine.connect() as connection:
+        before = connection.exec_driver_sql("SELECT * FROM campaign_touches ORDER BY id").mappings().all()
+    first = client.get(f"/campaigns/{campaign['id']}/safety", headers=headers())
+    second = client.get(f"/campaigns/{campaign['id']}/safety", headers=headers())
+    assert first.status_code == second.status_code == 200
+    assert first.json() == second.json()
+    with app.engine.connect() as connection:
+        after = connection.exec_driver_sql("SELECT * FROM campaign_touches ORDER BY id").mappings().all()
+    assert before == after
