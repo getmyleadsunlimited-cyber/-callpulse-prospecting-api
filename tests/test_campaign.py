@@ -1,4 +1,5 @@
 import importlib
+import io
 import json
 import re
 import subprocess
@@ -652,3 +653,67 @@ def test_microsoft_graph_auth_and_rate_limit_fail_safely_without_retry(monkeypat
         provider.send(sender="approved@example.com", recipient="recipient@example.com",
                       subject="subject", message="body", idempotency_key="key")
     assert calls == 1
+
+
+def test_microsoft_graph_auth_error_keeps_status_and_aadsts_but_redacts_credentials(
+        client, monkeypatch, caplog):
+    import app
+    import email_providers
+    email_providers.MicrosoftGraphEmailProvider._token_cache.clear()
+    client_secret = "super-secret-client-credential"
+    access_token = "eyJhbGciOi-secret-access-token"
+    bearer_token = "bearer-secret-credential"
+    body = json.dumps({
+        "error": "invalid_client",
+        "error_description": (
+            "AADSTS7000215: Invalid client secret. "
+            f"client_secret={client_secret}; access_token={access_token}; "
+            f"Authorization: Bearer {bearer_token}"
+        ),
+        "access_token": "top-level-token-must-be-ignored",
+    }).encode()
+
+    def auth_failure(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url, 401, "response reason must not be retained", {}, io.BytesIO(body))
+
+    monkeypatch.setattr(email_providers.urllib.request, "urlopen", auth_failure)
+    monkeypatch.setattr(app, "EMAIL_PROVIDER_NAME", "microsoft_graph")
+    monkeypatch.setattr(app, "EMAIL_FROM", "approved@example.com")
+    monkeypatch.setattr(app, "MICROSOFT_TENANT_ID", "tenant")
+    monkeypatch.setattr(app, "MICROSOFT_CLIENT_ID", "client")
+    monkeypatch.setattr(app, "MICROSOFT_CLIENT_SECRET", client_secret)
+    _, campaign = launch(
+        client, "graph-auth-failure@example.com", datetime.now(timezone.utc) - timedelta(minutes=1))
+    assert authorize(client, campaign["id"]).status_code == 200
+
+    response = execute_canary(client, campaign)
+    assert response.status_code == 502
+    state = client.get(
+        f"/deliveries/{campaign['touches'][0]['id']}/execution", headers=headers()).json()
+    persisted = state["last_execution_error"]
+    assert "HTTP 401" in persisted
+    assert "error=invalid_client" in persisted
+    assert "AADSTS7000215" in persisted
+    combined = persisted + caplog.text
+    assert "[REDACTED]" in persisted
+    assert all(secret not in combined for secret in (
+        client_secret, access_token, bearer_token, "top-level-token-must-be-ignored"))
+
+
+def test_microsoft_graph_unstructured_auth_error_retains_only_status_and_aadsts(monkeypatch):
+    import email_providers
+    email_providers.MicrosoftGraphEmailProvider._token_cache.clear()
+    raw_secret = "unstructured-secret-must-not-survive"
+
+    def auth_failure(request, timeout):
+        body = f"AADSTS900144 malformed request {raw_secret}".encode()
+        raise urllib.error.HTTPError(request.full_url, 400, "bad request", {}, io.BytesIO(body))
+
+    monkeypatch.setattr(email_providers.urllib.request, "urlopen", auth_failure)
+    provider = email_providers.MicrosoftGraphEmailProvider("tenant", "client", "client-secret")
+    with pytest.raises(email_providers.EmailProviderError) as caught:
+        provider._access_token()
+    reason = caught.value.reason
+    assert "HTTP 400" in reason and "AADSTS900144" in reason
+    assert raw_secret not in reason

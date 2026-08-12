@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 import threading
 import time
 import urllib.error
@@ -65,6 +66,49 @@ class MicrosoftGraphEmailProvider:
         self.client_id = client_id
         self._client_secret = client_secret
 
+    def _authentication_error(self, *, status: int | None = None,
+                              payload: object = None, raw_body: str = "") -> EmailProviderError:
+        """Build an actionable OAuth error from an allowlist of Microsoft fields."""
+        details: list[str] = []
+        if status is not None:
+            details.append(f"HTTP {status}")
+
+        error = description = ""
+        if isinstance(payload, dict):
+            error = payload.get("error") if isinstance(payload.get("error"), str) else ""
+            description = (payload.get("error_description")
+                           if isinstance(payload.get("error_description"), str) else "")
+
+        def redact(value: str) -> str:
+            # OAuth descriptions are useful, but Entra can echo submitted values. Redact
+            # both the configured secret and common credential-shaped values before the
+            # reason can reach logs, API audit rows, or delivery state.
+            if self._client_secret:
+                value = value.replace(self._client_secret, "[REDACTED]")
+            value = re.sub(
+                r"(?i)(access_token|refresh_token|client_secret|client_assertion|password|"
+                r"api[_-]?key|credential|token|secret)"
+                r"(\s*[:=]\s*)([^\s,;\"']+|\"[^\"]*\"|'[^']*')",
+                lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]", value,
+            )
+            value = re.sub(r"(?i)\b(Bearer|Basic)\s+[^\s,;\"']+",
+                           lambda match: f"{match.group(1)} [REDACTED]", value)
+            value = re.sub(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b",
+                           "[REDACTED]", value)
+            return value.replace("\r", " ").replace("\n", " ")
+
+        if error:
+            details.append(f"error={redact(error)}")
+        if description:
+            details.append(f"error_description={redact(description)}")
+        elif raw_body:
+            # Never retain an unstructured response body; only its non-secret AADSTS code.
+            aadsts = re.search(r"\bAADSTS\d+\b", raw_body, flags=re.IGNORECASE)
+            if aadsts:
+                details.append(f"error_code={aadsts.group(0).upper()}")
+        suffix = f" ({'; '.join(details)})" if details else ""
+        return EmailProviderError(f"microsoft graph authentication failed{suffix}")
+
     def _access_token(self) -> str:
         # A digest distinguishes credential rotation without retaining another plaintext copy.
         key = (self.tenant_id, self.client_id,
@@ -85,15 +129,30 @@ class MicrosoftGraphEmailProvider:
             )
             try:
                 with urllib.request.urlopen(request, timeout=20) as response:
-                    payload = json.loads(response.read())
-            except (urllib.error.HTTPError, ValueError, KeyError) as exc:
-                raise EmailProviderError("microsoft graph authentication failed") from exc
+                    raw_body = response.read().decode("utf-8", errors="replace")
+                    try:
+                        payload = json.loads(raw_body)
+                    except (ValueError, TypeError) as exc:
+                        raise self._authentication_error(
+                            status=response.status, raw_body=raw_body) from exc
+            except urllib.error.HTTPError as exc:
+                raw_body = exc.read().decode("utf-8", errors="replace")
+                try:
+                    error_payload = json.loads(raw_body)
+                except (ValueError, TypeError):
+                    error_payload = None
+                raise self._authentication_error(
+                    status=exc.code, payload=error_payload, raw_body=raw_body) from exc
             except (urllib.error.URLError, TimeoutError) as exc:
                 raise EmailProviderError("microsoft graph authentication network failure") from exc
-            token = payload.get("access_token")
+            token = payload.get("access_token") if isinstance(payload, dict) else None
             if not token:
-                raise EmailProviderError("microsoft graph authentication failed")
-            expires_in = max(0, int(payload.get("expires_in", 0)))
+                raise self._authentication_error(
+                    status=response.status, payload=payload, raw_body=raw_body)
+            try:
+                expires_in = max(0, int(payload.get("expires_in", 0)))
+            except (TypeError, ValueError) as exc:
+                raise self._authentication_error(status=response.status) from exc
             self._token_cache[key] = (token, time.time() + expires_in)
             return token
 
