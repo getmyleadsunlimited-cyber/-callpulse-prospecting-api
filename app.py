@@ -47,6 +47,8 @@ INDUSTRIES = GENERAL_INDUSTRIES + INSURANCE_INDUSTRIES
 MIN_QUALIFICATION_SCORE = 65
 DEFAULT_LOCATION = "Houston, TX"
 DEFAULT_WORKSPACE_ID = "callpulse-direct"
+WORKSPACE_ID_MAX_LENGTH = 100
+WORKSPACE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*")
 
 OPENING_MESSAGE_HELPERS = {
     "Roofing": "CallPulse AI Website Lead Recovery engages inspection and replacement visitors who leave your website without calling or requesting an estimate.",
@@ -188,6 +190,15 @@ class AuthenticatedIdentity:
         return self.role == "agency" and workspace_id in self.client_workspace_ids
 
 
+def validate_workspace_id(workspace_id: object) -> str:
+    """Return a workspace ID only when it exactly matches the persisted ID grammar."""
+    if (not isinstance(workspace_id, str) or not workspace_id
+            or len(workspace_id) > WORKSPACE_ID_MAX_LENGTH
+            or WORKSPACE_ID_PATTERN.fullmatch(workspace_id) is None):
+        raise ValueError("Workspace ID is invalid")
+    return workspace_id
+
+
 def load_tenant_credentials(raw: str) -> dict[str, AuthenticatedIdentity]:
     """Parse credential grants once at startup; malformed grants fail closed."""
     if not raw.strip():
@@ -204,10 +215,18 @@ def load_tenant_credentials(raw: str) -> dict[str, AuthenticatedIdentity]:
             raise RuntimeError("Every tenant credential must have a non-empty token and object grant")
         role, workspace_id = grant.get("role"), grant.get("workspace_id")
         clients = grant.get("client_workspace_ids", [])
-        if role not in {"direct", "agency", "client"} or not isinstance(workspace_id, str) or not workspace_id:
+        if role not in {"direct", "agency", "client"}:
             raise RuntimeError("Tenant credential role/workspace_id is invalid")
-        if not isinstance(clients, list) or any(not isinstance(item, str) or not item for item in clients):
-            raise RuntimeError("client_workspace_ids must be an array of non-empty strings")
+        try:
+            workspace_id = validate_workspace_id(workspace_id)
+        except ValueError as exc:
+            raise RuntimeError("Tenant credential role/workspace_id is invalid") from exc
+        if not isinstance(clients, list):
+            raise RuntimeError("client_workspace_ids must be an array of valid workspace IDs")
+        try:
+            clients = [validate_workspace_id(item) for item in clients]
+        except ValueError as exc:
+            raise RuntimeError("client_workspace_ids must be an array of valid workspace IDs") from exc
         if role != "agency" and clients:
             raise RuntimeError("Only agency credentials may grant client workspaces")
         identities[token] = AuthenticatedIdentity(role, workspace_id, frozenset(clients))
@@ -245,8 +264,9 @@ def workspace_context(x_workspace_id: str | None = Header(
     """Resolve and authorize tenant context before any tenant data is queried."""
     if x_workspace_id is None:
         return identity.workspace_id
-    workspace_id = x_workspace_id.strip()
-    if not workspace_id or len(workspace_id) > 100 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", workspace_id):
+    try:
+        workspace_id = validate_workspace_id(x_workspace_id)
+    except ValueError:
         raise HTTPException(400, "X-Workspace-ID is invalid")
     if not identity.permits(workspace_id):
         raise HTTPException(403, "Authenticated credential is not authorized for this workspace")
