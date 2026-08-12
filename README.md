@@ -38,6 +38,21 @@ A direct or client credential can use only its own workspace. An agency credenti
 
 The legacy `CALLPULSE_ACTIONS_API_KEY` is retained solely as a direct credential for `callpulse-direct`; it cannot switch tenants. `CALLPULSE_INTERNAL_ADMIN_API_KEY` is an optional, separate unrestricted internal-admin credential and must never be issued to an agency, client, or direct customer.
 
+### Customer users and roles
+
+Customer users are persistent members of an account and authenticate with `POST /auth/login`. Passwords must be at least 12 characters and are stored only as salted PBKDF2-SHA256 hashes; login returns a random opaque bearer token whose SHA-256 digest, rather than the token itself, is persisted. Deactivating a user revokes all of that user's sessions. `GET /me` returns the authenticated identity, account binding, role, and authorized workspace set.
+
+Roles are enforced server-side on every state-changing operation:
+
+* **owner** — full workspace control and the only customer role that may list, create/invite, change the role of, deactivate, or change workspace access for users;
+* **admin** — prospect/campaign operations, suppressions, replies/conversions, safety authorization, canary execution, and workspace operations, but no user management or ownership transfer;
+* **member** — read operational data and create prospects/campaigns, but no users, tenant credentials, suppression/reply/conversion administration, or live execution controls;
+* **viewer** — read-only operational access.
+
+An internal administrator bootstraps an account owner through `POST /users` by supplying `account_id`, `account_type`, and `primary_workspace_id`; subsequent owner-created users inherit those account fields. User administration is available at `GET/POST /users`, `PATCH /users/{user_id}/role`, `POST /users/{user_id}/deactivate`, and `PUT /users/{user_id}/workspace-access`. Creation, role change, deactivation, and workspace-grant replacement write immutable `user_audits` records.
+
+Every customer session resolves its workspace authorization from persisted user grants. Direct-account and client users are restricted to their primary workspace. Agency users may select their agency workspace or explicitly granted client workspaces only. Owners cannot grant a workspace they cannot themselves access, and `X-Workspace-ID` remains only a selector. Foreign workspace selection is `403`; resource lookup remains scoped first and returns `404` for foreign IDs. The legacy bearer grants and the separate internal-admin credential remain supported and are not weakened.
+
 ## Production campaign
 
 The service supports the business verticals exposed at `/launcher` and qualifies only prospects scoring at least 65 with independently verified business emails. Selecting a vertical supplies its CallPulse AI Website Lead Recovery opening angle. Launching a campaign creates exactly three idempotent touches for Day 0, Day 3, and Day 6 and closes the seven-day campaign on Day 7. Replies, conversions, opt-outs, hard-bounce suppressions, and other suppressions immediately stop further outreach.

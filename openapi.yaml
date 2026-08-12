@@ -10,6 +10,53 @@ servers:
   - url: https://callpulse-prospecting-api.onrender.com
 security: [{bearerAuth: []}]
 paths:
+  /auth/login:
+    post:
+      security: []
+      operationId: loginCustomerUser
+      summary: Exchange a customer email and password for an opaque bearer token.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/Login'}}}
+      responses: {'200': {description: Bearer token}, '401': {description: Invalid credentials}}
+  /me:
+    get:
+      operationId: currentUser
+      summary: Return the authenticated user's account, role, and authorized workspace set.
+      responses: {'200': {description: Current user identity}, '401': {description: Unauthorized}}
+  /users:
+    get:
+      operationId: listUsers
+      summary: List users in the owner's account.
+      responses: {'200': {description: Account users}, '403': {description: Owner role required}}
+    post:
+      operationId: inviteUser
+      summary: Create a user invitation with an initial password (owner or internal administrator only).
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/UserCreate'}}}
+      responses: {'201': {description: User created and audited}, '403': {description: Owner role required}}
+  /users/{user_id}/role:
+    patch:
+      operationId: changeUserRole
+      parameters: [{in: path, name: user_id, required: true, schema: {type: integer}}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object, required: [role], properties: {role: {$ref: '#/components/schemas/UserRole'}}}}}
+      responses: {'200': {description: Role changed and audited}, '404': {description: User not found in account}}
+  /users/{user_id}/deactivate:
+    post:
+      operationId: deactivateUser
+      parameters: [{in: path, name: user_id, required: true, schema: {type: integer}}]
+      responses: {'200': {description: User deactivated, sessions revoked, and action audited}}
+  /users/{user_id}/workspace-access:
+    put:
+      operationId: changeUserWorkspaceAccess
+      parameters: [{in: path, name: user_id, required: true, schema: {type: integer}}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object, required: [workspace_ids], properties: {workspace_ids: {type: array, items: {type: string}}}}}}
+      responses: {'200': {description: Workspace grants replaced and audited}, '403': {description: Grant exceeds owner's access}}
   /health:
     get:
       security: []
@@ -228,6 +275,24 @@ components:
       description: Selects only a workspace already granted to the bearer credential; never grants access. Omission selects the credential's own workspace.
       schema: {type: string}
   schemas:
+    Login:
+      type: object
+      required: [email, password]
+      properties: {email: {type: string, format: email}, password: {type: string, format: password}}
+    UserRole:
+      type: string
+      enum: [owner, admin, member, viewer]
+    UserCreate:
+      type: object
+      required: [email, password, role]
+      properties:
+        email: {type: string, format: email}
+        password: {type: string, format: password, minLength: 12, writeOnly: true}
+        role: {$ref: '#/components/schemas/UserRole'}
+        account_id: {type: [string, 'null'], description: Internal-administrator bootstrap only; owners inherit their account.}
+        account_type: {type: [string, 'null'], enum: [direct, agency, client, null]}
+        primary_workspace_id: {type: [string, 'null']}
+        workspace_ids: {type: array, items: {type: string}, default: []}
     CampaignSequenceState:
       type: object
       required: [day, status, scheduled_at, sent_at]

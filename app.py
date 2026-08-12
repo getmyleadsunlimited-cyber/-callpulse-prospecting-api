@@ -6,9 +6,10 @@ import hmac
 import json
 import os
 import re
+import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Literal
+from typing import Literal, Callable
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -170,6 +171,47 @@ class CanaryExecutionAudit(Base):
     failure_reason: Mapped[str | None] = mapped_column(String(1000))
 
 
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(500))
+    account_id: Mapped[str] = mapped_column(String(100), index=True)
+    account_type: Mapped[str] = mapped_column(String(20))
+    primary_workspace_id: Mapped[str] = mapped_column(String(100))
+    role: Mapped[str] = mapped_column(String(20))
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    workspace_grants: Mapped[list[UserWorkspaceAccess]] = relationship(cascade="all, delete-orphan")
+
+
+class UserWorkspaceAccess(Base):
+    __tablename__ = "user_workspace_access"
+    __table_args__ = (UniqueConstraint("user_id", "workspace_id", name="uq_user_workspace_access"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    workspace_id: Mapped[str] = mapped_column(String(100), index=True)
+
+
+class UserSession(Base):
+    __tablename__ = "user_sessions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class UserAudit(Base):
+    __tablename__ = "user_audits"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(100), index=True)
+    actor_user_id: Mapped[int | None] = mapped_column(Integer)
+    target_user_id: Mapped[int] = mapped_column(Integer, index=True)
+    action: Mapped[str] = mapped_column(String(50))
+    details: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 Base.metadata.create_all(engine)
 app = FastAPI(title="CallPulse Autonomous Campaign API", version="3.0.0")
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -181,6 +223,10 @@ class AuthenticatedIdentity:
     role: Literal["direct", "agency", "client", "internal_admin"]
     workspace_id: str
     client_workspace_ids: frozenset[str] = frozenset()
+    access_role: Literal["owner", "admin", "member", "viewer"] = "owner"
+    account_id: str | None = None
+    user_id: int | None = None
+    email: str | None = None
 
     def permits(self, workspace_id: str) -> bool:
         if self.role == "internal_admin":
@@ -254,7 +300,42 @@ def require_auth(credentials: HTTPAuthorizationCredentials | None = Depends(bear
     for token, identity in TENANT_CREDENTIALS.items():
         if hmac.compare_digest(supplied, token):
             return identity
+    token_hash = hashlib.sha256(supplied.encode()).hexdigest()
+    with SessionLocal() as db:
+        session = db.scalar(select(UserSession).where(UserSession.token_hash == token_hash))
+        user = db.get(User, session.user_id) if session else None
+        if user and user.active:
+            grants = frozenset(x.workspace_id for x in user.workspace_grants)
+            return AuthenticatedIdentity(user.account_type, user.primary_workspace_id, grants,
+                                         user.role, user.account_id, user.id, user.email)
     raise HTTPException(401, "Valid bearer authentication is required")
+
+
+def require_roles(*roles: str) -> Callable:
+    def dependency(identity: AuthenticatedIdentity = Depends(require_auth)) -> AuthenticatedIdentity:
+        if identity.role == "internal_admin" or identity.access_role in roles:
+            return identity
+        raise HTTPException(403, "Your role does not permit this operation")
+    return dependency
+
+
+def hash_password(password: str, salt: bytes | None = None) -> str:
+    if len(password) < 12:
+        raise ValueError("Password must contain at least 12 characters")
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 310_000)
+    return f"pbkdf2_sha256$310000${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        algorithm, rounds, salt, expected = encoded.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), int(rounds))
+        return hmac.compare_digest(actual, bytes.fromhex(expected))
+    except (ValueError, TypeError):
+        return False
 
 
 def workspace_context(x_workspace_id: str | None = Header(
@@ -375,6 +456,29 @@ class ReplyIn(BaseModel):
 
 class ConversionIn(BaseModel):
     conversion_stage: Literal["signup_link_sent", "standard_start", "three_day_trial", "converted", "declined"]
+
+
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
+
+class UserCreateIn(BaseModel):
+    email: str
+    password: str = Field(min_length=12)
+    role: Literal["owner", "admin", "member", "viewer"]
+    account_id: str | None = None
+    account_type: Literal["direct", "agency", "client"] | None = None
+    primary_workspace_id: str | None = None
+    workspace_ids: list[str] = Field(default_factory=list)
+
+
+class RoleChangeIn(BaseModel):
+    role: Literal["owner", "admin", "member", "viewer"]
+
+
+class WorkspaceAccessIn(BaseModel):
+    workspace_ids: list[str]
 
 
 class CampaignSequenceState(BaseModel):
@@ -546,6 +650,131 @@ def add_canary_audit(db: Session, touch: Touch, authorized_by: str, result: str,
     ))
 
 
+def user_dict(user: User) -> dict:
+    return {"id": user.id, "email": user.email, "account_id": user.account_id,
+            "account_type": user.account_type, "primary_workspace_id": user.primary_workspace_id,
+            "role": user.role, "active": user.active,
+            "workspace_ids": sorted(x.workspace_id for x in user.workspace_grants)}
+
+
+def managed_user(db: Session, user_id: int, identity: AuthenticatedIdentity) -> User:
+    user = db.get(User, user_id)
+    if not user or (identity.role != "internal_admin" and user.account_id != identity.account_id):
+        raise HTTPException(404, "User not found")
+    return user
+
+
+def audit_user(db: Session, identity: AuthenticatedIdentity, user: User, action: str, details: dict) -> None:
+    db.add(UserAudit(account_id=user.account_id, actor_user_id=identity.user_id,
+                     target_user_id=user.id, action=action, details=json.dumps(details, sort_keys=True)))
+
+
+@app.post("/auth/login")
+def login(body: LoginIn, db: Session = Depends(db_session)):
+    try:
+        email = normalize_email(body.email)
+    except ValueError:
+        raise HTTPException(401, "Invalid email or password")
+    user = db.scalar(select(User).where(User.email == email))
+    if not user or not user.active or not verify_password(body.password, user.password_hash):
+        raise HTTPException(401, "Invalid email or password")
+    token = secrets.token_urlsafe(32)
+    db.add(UserSession(user_id=user.id, token_hash=hashlib.sha256(token.encode()).hexdigest()))
+    db.commit()
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@app.get("/me", dependencies=[Depends(require_auth)])
+def current_user(identity: AuthenticatedIdentity = Depends(require_auth)):
+    return {"id": identity.user_id, "email": identity.email, "account_id": identity.account_id,
+            "role": identity.access_role, "account_type": identity.role,
+            "primary_workspace_id": identity.workspace_id,
+            "workspace_ids": sorted({identity.workspace_id, *identity.client_workspace_ids})}
+
+
+@app.post("/users", status_code=201, dependencies=[Depends(require_roles("owner"))])
+def create_user(body: UserCreateIn, identity: AuthenticatedIdentity = Depends(require_auth),
+                db: Session = Depends(db_session)):
+    internal = identity.role == "internal_admin"
+    account_id = body.account_id if internal else identity.account_id
+    account_type = body.account_type if internal else identity.role
+    primary = body.primary_workspace_id if internal else identity.workspace_id
+    if not account_id or account_type not in {"direct", "agency", "client"} or not primary:
+        raise HTTPException(422, "account_id, account_type, and primary_workspace_id are required")
+    try:
+        email, primary = normalize_email(body.email), validate_workspace_id(primary)
+        workspaces = {validate_workspace_id(x) for x in body.workspace_ids}
+        encoded = hash_password(body.password)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    if not internal and not all(identity.permits(x) for x in workspaces):
+        raise HTTPException(403, "Cannot grant a workspace outside your authorized set")
+    if account_type != "agency" and workspaces - {primary}:
+        raise HTTPException(422, "Client and direct users may access only their primary workspace")
+    workspaces.add(primary)
+    user = User(email=email, password_hash=encoded, account_id=account_id,
+                account_type=account_type, primary_workspace_id=primary, role=body.role)
+    user.workspace_grants = [UserWorkspaceAccess(workspace_id=x) for x in sorted(workspaces)]
+    db.add(user)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "A user with this email already exists")
+    audit_user(db, identity, user, "user_created", {"role": user.role, "workspace_ids": sorted(workspaces)})
+    db.commit()
+    return user_dict(user)
+
+
+@app.get("/users", dependencies=[Depends(require_roles("owner"))])
+def list_users(identity: AuthenticatedIdentity = Depends(require_auth), db: Session = Depends(db_session)):
+    query = select(User) if identity.role == "internal_admin" else select(User).where(User.account_id == identity.account_id)
+    return [user_dict(user) for user in db.scalars(query.order_by(User.id))]
+
+
+@app.patch("/users/{user_id}/role", dependencies=[Depends(require_roles("owner"))])
+def change_user_role(user_id: int, body: RoleChangeIn, identity: AuthenticatedIdentity = Depends(require_auth),
+                     db: Session = Depends(db_session)):
+    user = managed_user(db, user_id, identity)
+    old = user.role
+    user.role = body.role
+    audit_user(db, identity, user, "role_changed", {"from": old, "to": body.role})
+    db.commit()
+    return user_dict(user)
+
+
+@app.post("/users/{user_id}/deactivate", dependencies=[Depends(require_roles("owner"))])
+def deactivate_user(user_id: int, identity: AuthenticatedIdentity = Depends(require_auth),
+                    db: Session = Depends(db_session)):
+    user = managed_user(db, user_id, identity)
+    if user.id == identity.user_id:
+        raise HTTPException(409, "Owners cannot deactivate their own active session")
+    user.active = False
+    db.execute(UserSession.__table__.delete().where(UserSession.user_id == user.id))
+    audit_user(db, identity, user, "user_deactivated", {})
+    db.commit()
+    return user_dict(user)
+
+
+@app.put("/users/{user_id}/workspace-access", dependencies=[Depends(require_roles("owner"))])
+def change_workspace_access(user_id: int, body: WorkspaceAccessIn,
+                            identity: AuthenticatedIdentity = Depends(require_auth), db: Session = Depends(db_session)):
+    user = managed_user(db, user_id, identity)
+    try:
+        workspaces = {validate_workspace_id(x) for x in body.workspace_ids} | {user.primary_workspace_id}
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    if identity.role != "internal_admin" and not all(identity.permits(x) for x in workspaces):
+        raise HTTPException(403, "Cannot grant a workspace outside your authorized set")
+    if user.account_type != "agency" and workspaces != {user.primary_workspace_id}:
+        raise HTTPException(422, "Client and direct users may access only their primary workspace")
+    old = sorted(x.workspace_id for x in user.workspace_grants)
+    user.workspace_grants = [UserWorkspaceAccess(workspace_id=x) for x in sorted(workspaces)]
+    audit_user(db, identity, user, "workspace_access_changed", {"from": old, "to": sorted(workspaces)})
+    db.commit()
+    return user_dict(user)
+
+
 @app.get("/health")
 def health(db: Session = Depends(db_session)):
     db.execute(select(1))
@@ -693,7 +922,7 @@ def industry_buttons():
              "opening_message": OPENING_MESSAGE_HELPERS[name]} for name in INDUSTRIES]
 
 
-@app.post("/prospects", status_code=201, dependencies=[Depends(require_auth)])
+@app.post("/prospects", status_code=201, dependencies=[Depends(require_roles("owner", "admin", "member"))])
 def create_prospect(body: ProspectIn, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
     if not body.email_verified:
         raise HTTPException(422, "Only independently verified email addresses qualify")
@@ -751,7 +980,7 @@ def authorization_failures(campaign: Campaign, body: LiveAuthorizationIn, db: Se
     return failures
 
 
-@app.post("/campaigns/{campaign_id}/authorize-live", dependencies=[Depends(require_auth)],
+@app.post("/campaigns/{campaign_id}/authorize-live", dependencies=[Depends(require_roles("owner", "admin"))],
           summary="Explicitly authorize a campaign for future live execution.")
 def authorize_live(campaign_id: int, body: LiveAuthorizationIn, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
     campaign = scoped_campaign(db, campaign_id, workspace_id)
@@ -846,7 +1075,7 @@ def inspect_canary_audits(campaign_id: int, workspace_id: str = Depends(workspac
              for column in audit.__table__.columns} for audit in audits]
 
 
-@app.post("/campaigns/{campaign_id}/canary-execute", dependencies=[Depends(require_auth)],
+@app.post("/campaigns/{campaign_id}/canary-execute", dependencies=[Depends(require_roles("owner", "admin"))],
           summary="Explicitly attempt no more than one persisted email delivery.")
 def canary_execute(campaign_id: int, body: CanaryExecutionIn, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
     """Claim exactly one explicitly named delivery; never enumerate campaign deliveries."""
@@ -971,7 +1200,7 @@ def canary_execute(campaign_id: int, body: CanaryExecutionIn, workspace_id: str 
             "provider_message_id": touch.provider_message_id}
 
 
-@app.post("/prospects/{prospect_id}/campaigns", status_code=201, dependencies=[Depends(require_auth)])
+@app.post("/prospects/{prospect_id}/campaigns", status_code=201, dependencies=[Depends(require_roles("owner", "admin", "member"))])
 def launch_campaign(prospect_id: int, body: CampaignIn, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
     p = scoped_prospect(db, prospect_id, workspace_id)
     if not p:
@@ -1005,7 +1234,7 @@ def launch_campaign(prospect_id: int, body: CampaignIn, workspace_id: str = Depe
     return campaign_dict(campaign)
 
 
-@app.post("/launcher/run", dependencies=[Depends(require_auth)])
+@app.post("/launcher/run", dependencies=[Depends(require_roles("owner", "admin"))])
 def run_launcher(now_at: datetime | None = None, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
     current = now_at or utcnow()
     if current.tzinfo is None:
@@ -1035,7 +1264,7 @@ def run_launcher(now_at: datetime | None = None, workspace_id: str = Depends(wor
     return {"processed": len(due), "sent_or_simulated": sent, "suppressed": skipped, "failed": failed, "dry_run": DRY_RUN}
 
 
-@app.post("/suppressions", status_code=201, dependencies=[Depends(require_auth)])
+@app.post("/suppressions", status_code=201, dependencies=[Depends(require_roles("owner", "admin"))])
 def suppress(body: SuppressionIn, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
     item = db.get(Suppression, (body.email, workspace_id))
     if not item:
@@ -1054,7 +1283,7 @@ def suppress(body: SuppressionIn, workspace_id: str = Depends(workspace_context)
     return {"email": item.email, "reason": item.reason}
 
 
-@app.post("/prospects/{prospect_id}/reply", dependencies=[Depends(require_auth)])
+@app.post("/prospects/{prospect_id}/reply", dependencies=[Depends(require_roles("owner", "admin"))])
 def record_reply(prospect_id: int, body: ReplyIn, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
     p = scoped_prospect(db, prospect_id, workspace_id)
     if not p:
@@ -1067,7 +1296,7 @@ def record_reply(prospect_id: int, body: ReplyIn, workspace_id: str = Depends(wo
     return prospect_dict(p)
 
 
-@app.post("/prospects/{prospect_id}/conversion", dependencies=[Depends(require_auth)])
+@app.post("/prospects/{prospect_id}/conversion", dependencies=[Depends(require_roles("owner", "admin"))])
 def conversion(prospect_id: int, body: ConversionIn, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
     p = scoped_prospect(db, prospect_id, workspace_id)
     if not p:

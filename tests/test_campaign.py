@@ -25,6 +25,7 @@ VERTICALS = [
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/test.db")
     monkeypatch.setenv("CALLPULSE_ACTIONS_API_KEY", "secret")
+    monkeypatch.setenv("CALLPULSE_INTERNAL_ADMIN_API_KEY", "internal-secret")
     monkeypatch.setenv("CALLPULSE_TENANT_CREDENTIALS", json.dumps({
         "agency-a-token": {"role": "agency", "workspace_id": "agency-a",
                            "client_workspace_ids": ["client-a"]},
@@ -42,6 +43,19 @@ def client(tmp_path, monkeypatch):
 def headers(): return {"Authorization": "Bearer secret"}
 
 
+def user_token(client, email, role, account_id="account-a", account_type="direct",
+               primary_workspace_id="workspace-a", workspace_ids=None):
+    created = client.post("/users", headers={"Authorization": "Bearer internal-secret"}, json={
+        "email": email, "password": "correct-horse-battery-staple", "role": role,
+        "account_id": account_id, "account_type": account_type,
+        "primary_workspace_id": primary_workspace_id, "workspace_ids": workspace_ids or [],
+    })
+    assert created.status_code == 201, created.text
+    login = client.post("/auth/login", json={"email": email, "password": "correct-horse-battery-staple"})
+    assert login.status_code == 200
+    return login.json()["access_token"], created.json()
+
+
 def prospect(email="verified@example.com", verified=True):
     return {"company_name": "Example Agency", "website": "https://example.com", "industry": "Final Expense", "score": 91,
             "why_now": "Missed calls", "ai_recovery_opportunity": "Immediate callbacks", "verified_email": email,
@@ -55,6 +69,47 @@ def test_missing_token_returns_401(client):
 def test_wrong_token_returns_401(client):
     response = client.get("/prospects", headers={"Authorization": "Bearer wrong"})
     assert response.status_code == 401
+
+
+def test_customer_roles_and_passwords_are_enforced(client):
+    viewer, _ = user_token(client, "viewer@example.com", "viewer")
+    member, _ = user_token(client, "member@example.com", "member")
+    owner, _ = user_token(client, "owner@example.com", "owner")
+    viewer_headers = {"Authorization": f"Bearer {viewer}"}
+    member_headers = {"Authorization": f"Bearer {member}"}
+    owner_headers = {"Authorization": f"Bearer {owner}"}
+
+    assert client.get("/prospects", headers=viewer_headers).status_code == 200
+    assert client.post("/prospects", headers=viewer_headers, json=prospect()).status_code == 403
+    assert client.post("/prospects", headers=member_headers, json=prospect("member@example.net")).status_code == 201
+    assert client.post("/suppressions", headers=member_headers,
+                       json={"email": "x@example.com", "reason": "opt out"}).status_code == 403
+    assert client.get("/users", headers=member_headers).status_code == 403
+    assert client.get("/users", headers=owner_headers).status_code == 200
+    import app
+    with app.SessionLocal() as db:
+        assert all("correct-horse" not in user.password_hash for user in db.query(app.User).all())
+        assert db.query(app.UserAudit).filter_by(action="user_created").count() >= 3
+
+
+def test_customer_workspace_grants_preserve_tenant_isolation(client):
+    agency, _ = user_token(client, "agency@example.com", "admin", account_id="agency-account",
+                           account_type="agency", primary_workspace_id="agency-home",
+                           workspace_ids=["client-granted"])
+    client_token, _ = user_token(client, "client@example.com", "admin", account_id="client-account",
+                                 account_type="client", primary_workspace_id="client-granted")
+    agency_headers = {"Authorization": f"Bearer {agency}", "X-Workspace-ID": "client-granted"}
+    created = client.post("/prospects", headers=agency_headers, json=prospect("isolated@example.com"))
+    assert created.status_code == 201
+    assert client.get("/prospects", headers={"Authorization": f"Bearer {agency}",
+                                              "X-Workspace-ID": "client-not-granted"}).status_code == 403
+    assert client.get(f"/prospects/{created.json()['id']}/campaigns",
+                      headers={"Authorization": f"Bearer {client_token}",
+                               "X-Workspace-ID": "client-granted"}).status_code == 200
+    direct, _ = user_token(client, "direct@example.com", "viewer", account_id="direct-account",
+                           primary_workspace_id="other-workspace")
+    assert client.get(f"/prospects/{created.json()['id']}/campaigns",
+                      headers={"Authorization": f"Bearer {direct}"}).status_code == 404
 
 
 def test_correct_token_allows_protected_endpoint(client):
