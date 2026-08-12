@@ -9,7 +9,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -68,8 +68,32 @@ class Base(DeclarativeBase):
     pass
 
 
+class Account(Base):
+    __tablename__ = "accounts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_type: Mapped[str] = mapped_column(String(20), index=True)
+    agency_name: Mapped[str | None] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    workspaces: Mapped[list[ClientWorkspace]] = relationship(back_populates="account", cascade="all, delete-orphan")
+
+
+class ClientWorkspace(Base):
+    __tablename__ = "client_workspaces"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"), index=True)
+    client_business_name: Mapped[str] = mapped_column(String(200))
+    industry: Mapped[str | None] = mapped_column(String(100))
+    website: Mapped[str | None] = mapped_column(String(500))
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    white_label_display_name: Mapped[str | None] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    account: Mapped[Account] = relationship(back_populates="workspaces")
+
+
 class Prospect(Base):
     __tablename__ = "prospects"
+    __table_args__ = (UniqueConstraint("workspace_id", "verified_email", name="uq_workspace_prospect_email"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     company_name: Mapped[str] = mapped_column(String(200))
     website: Mapped[str] = mapped_column(String(500))
@@ -80,7 +104,8 @@ class Prospect(Base):
     ai_recovery_opportunity: Mapped[str] = mapped_column(Text)
     decision_maker_name: Mapped[str | None] = mapped_column(String(200))
     decision_maker_title: Mapped[str | None] = mapped_column(String(200))
-    verified_email: Mapped[str | None] = mapped_column(String(320), unique=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("client_workspaces.id", ondelete="CASCADE"), index=True)
+    verified_email: Mapped[str | None] = mapped_column(String(320))
     email_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     opening_message: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(40), default="researched", index=True)
@@ -96,6 +121,7 @@ class Campaign(Base):
     __tablename__ = "campaigns"
     __table_args__ = (UniqueConstraint("prospect_id", name="uq_active_campaign_prospect"),)
     id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("client_workspaces.id", ondelete="CASCADE"), index=True)
     prospect_id: Mapped[int] = mapped_column(ForeignKey("prospects.id", ondelete="CASCADE"))
     status: Mapped[str] = mapped_column(String(30), default="active", index=True)
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -112,6 +138,7 @@ class Touch(Base):
     __tablename__ = "campaign_touches"
     __table_args__ = (UniqueConstraint("campaign_id", "day", name="uq_campaign_touch_day"),)
     id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("client_workspaces.id", ondelete="CASCADE"), index=True)
     campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id", ondelete="CASCADE"))
     day: Mapped[int] = mapped_column(Integer)
     scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
@@ -137,7 +164,10 @@ class Touch(Base):
 
 class Suppression(Base):
     __tablename__ = "suppressions"
-    email: Mapped[str] = mapped_column(String(320), primary_key=True)
+    __table_args__ = (UniqueConstraint("workspace_id", "email", name="uq_workspace_suppression_email"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("client_workspaces.id", ondelete="CASCADE"), index=True)
+    email: Mapped[str] = mapped_column(String(320))
     reason: Mapped[str] = mapped_column(String(200))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
@@ -145,6 +175,7 @@ class Suppression(Base):
 class CanaryExecutionAudit(Base):
     __tablename__ = "canary_execution_audits"
     id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("client_workspaces.id", ondelete="CASCADE"), index=True)
     campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id", ondelete="CASCADE"), index=True)
     delivery_id: Mapped[int] = mapped_column(ForeignKey("campaign_touches.id", ondelete="CASCADE"), index=True)
     prospect_id: Mapped[int] = mapped_column(ForeignKey("prospects.id", ondelete="CASCADE"), index=True)
@@ -179,6 +210,25 @@ def require_auth(credentials: HTTPAuthorizationCredentials | None = Depends(bear
         or not hmac.compare_digest(credentials.credentials, API_KEY)
     ):
         raise HTTPException(401, "Valid bearer authentication is required")
+
+
+def current_workspace(x_workspace_id: int | None = Header(None, alias="X-Workspace-ID"),
+                      db: Session = Depends(db_session), _auth: None = Depends(require_auth)) -> ClientWorkspace:
+    """Resolve tenant context; retain a default direct workspace for legacy callers."""
+    if x_workspace_id is not None:
+        workspace = db.get(ClientWorkspace, x_workspace_id)
+        if not workspace or workspace.status != "active":
+            raise HTTPException(404, "Workspace not found")
+        return workspace
+    workspace = db.scalar(select(ClientWorkspace).join(Account).where(
+        Account.account_type == "direct", ClientWorkspace.client_business_name == "CallPulse Direct"))
+    if workspace:
+        return workspace
+    account = Account(account_type="direct", agency_name=None, status="active")
+    workspace = ClientWorkspace(account=account, client_business_name="CallPulse Direct", status="active")
+    db.add(workspace)
+    db.commit()
+    return workspace
 
 
 def utcnow() -> datetime:
@@ -230,6 +280,19 @@ class ProspectIn(BaseModel):
 class CampaignIn(BaseModel):
     start_at: datetime | None = None
     idempotency_key: str = Field(min_length=8, max_length=100)
+
+
+class AccountIn(BaseModel):
+    account_type: Literal["direct", "agency"]
+    agency_name: str | None = Field(None, min_length=1, max_length=200)
+    status: str = Field("active", min_length=1, max_length=40)
+
+class WorkspaceIn(BaseModel):
+    client_business_name: str = Field(min_length=1, max_length=200)
+    industry: str | None = Field(None, max_length=100)
+    website: str | None = Field(None, pattern=r"^https?://")
+    status: str = Field("active", min_length=1, max_length=40)
+    white_label_display_name: str | None = Field(None, max_length=200)
 
 
 class LiveAuthorizationIn(BaseModel):
@@ -349,7 +412,8 @@ def delivery_inspection(t: Touch) -> dict:
 
 def prospect_suppressed(prospect: Prospect, db: Session) -> bool:
     return prospect.status == "suppressed" or bool(
-        prospect.verified_email and db.get(Suppression, prospect.verified_email)
+        prospect.verified_email and db.scalar(select(Suppression).where(
+            Suppression.workspace_id == prospect.workspace_id, Suppression.email == prospect.verified_email))
     )
 
 
@@ -429,6 +493,7 @@ def add_canary_audit(db: Session, touch: Touch, authorized_by: str, result: str,
                      provider_correlation_id: str | None = None) -> None:
     campaign, prospect = touch.campaign, touch.campaign.prospect
     db.add(CanaryExecutionAudit(
+        workspace_id=touch.workspace_id,
         campaign_id=campaign.id, delivery_id=touch.id, prospect_id=prospect.id,
         authorized_by=authorized_by.strip(), authorization_timestamp=campaign.live_authorized_at,
         execution_requested_at=utcnow(), sender_identity=EMAIL_FROM,
@@ -586,11 +651,72 @@ def industry_buttons():
              "opening_message": OPENING_MESSAGE_HELPERS[name]} for name in INDUSTRIES]
 
 
+def account_dict(account: Account) -> dict:
+    return {c.name: getattr(account, c.name) for c in account.__table__.columns}
+
+
+def workspace_dict(workspace: ClientWorkspace) -> dict:
+    return {c.name: getattr(workspace, c.name) for c in workspace.__table__.columns}
+
+
+@app.post("/accounts", status_code=201, dependencies=[Depends(require_auth)])
+def create_account(body: AccountIn, db: Session = Depends(db_session)):
+    if body.account_type == "agency" and not body.agency_name:
+        raise HTTPException(422, "agency_name is required for agency accounts")
+    account = Account(**body.model_dump())
+    db.add(account)
+    db.commit()
+    return account_dict(account)
+
+
+@app.get("/accounts", dependencies=[Depends(require_auth)])
+def list_accounts(account_type: Literal["direct", "agency"] | None = None, db: Session = Depends(db_session)):
+    query = select(Account)
+    if account_type:
+        query = query.where(Account.account_type == account_type)
+    return [account_dict(item) for item in db.scalars(query.order_by(Account.id))]
+
+
+@app.get("/accounts/{account_id}", dependencies=[Depends(require_auth)])
+def read_account(account_id: int, db: Session = Depends(db_session)):
+    account = db.get(Account, account_id)
+    if not account:
+        raise HTTPException(404, "Account not found")
+    return account_dict(account)
+
+
+@app.post("/accounts/{account_id}/workspaces", status_code=201, dependencies=[Depends(require_auth)])
+def create_workspace(account_id: int, body: WorkspaceIn, db: Session = Depends(db_session)):
+    account = db.get(Account, account_id)
+    if not account:
+        raise HTTPException(404, "Account not found")
+    workspace = ClientWorkspace(account_id=account.id, **body.model_dump())
+    db.add(workspace)
+    db.commit()
+    return workspace_dict(workspace)
+
+
+@app.get("/accounts/{account_id}/workspaces", dependencies=[Depends(require_auth)])
+def list_workspaces(account_id: int, db: Session = Depends(db_session)):
+    if not db.get(Account, account_id):
+        raise HTTPException(404, "Account not found")
+    return [workspace_dict(item) for item in db.scalars(select(ClientWorkspace).where(
+        ClientWorkspace.account_id == account_id).order_by(ClientWorkspace.id))]
+
+
+@app.get("/workspaces/{workspace_id}", dependencies=[Depends(require_auth)])
+def read_workspace(workspace_id: int, db: Session = Depends(db_session)):
+    workspace = db.get(ClientWorkspace, workspace_id)
+    if not workspace:
+        raise HTTPException(404, "Workspace not found")
+    return workspace_dict(workspace)
+
+
 @app.post("/prospects", status_code=201, dependencies=[Depends(require_auth)])
-def create_prospect(body: ProspectIn, db: Session = Depends(db_session)):
+def create_prospect(body: ProspectIn, db: Session = Depends(db_session), workspace: ClientWorkspace = Depends(current_workspace)):
     if not body.email_verified:
         raise HTTPException(422, "Only independently verified email addresses qualify")
-    p = Prospect(**body.model_dump())
+    p = Prospect(workspace_id=workspace.id, **body.model_dump())
     db.add(p)
     try:
         db.commit()
@@ -602,8 +728,9 @@ def create_prospect(body: ProspectIn, db: Session = Depends(db_session)):
 
 @app.get("/prospects", dependencies=[Depends(require_auth)])
 def list_prospects(status: str | None = None, industry: str | None = None,
-                   limit: int = Query(25, ge=1, le=100), db: Session = Depends(db_session)):
-    query = select(Prospect)
+                   limit: int = Query(25, ge=1, le=100), db: Session = Depends(db_session),
+                   workspace: ClientWorkspace = Depends(current_workspace)):
+    query = select(Prospect).where(Prospect.workspace_id == workspace.id)
     if status:
         query = query.where(Prospect.status == status)
     if industry:
@@ -613,8 +740,8 @@ def list_prospects(status: str | None = None, industry: str | None = None,
 
 @app.get("/prospects/{prospect_id}/campaigns", response_model=list[CampaignInspection],
          dependencies=[Depends(require_auth)], summary="Inspect a prospect's campaigns without changing state.")
-def inspect_prospect_campaigns(prospect_id: int, db: Session = Depends(db_session)):
-    prospect = db.get(Prospect, prospect_id)
+def inspect_prospect_campaigns(prospect_id: int, db: Session = Depends(db_session), workspace: ClientWorkspace = Depends(current_workspace)):
+    prospect = db.scalar(select(Prospect).where(Prospect.id == prospect_id, Prospect.workspace_id == workspace.id))
     if not prospect:
         raise HTTPException(404, "Prospect not found")
     return [campaign_inspection(c) for c in sorted(prospect.campaigns, key=lambda campaign: campaign.id)]
@@ -622,8 +749,8 @@ def inspect_prospect_campaigns(prospect_id: int, db: Session = Depends(db_sessio
 
 @app.get("/campaigns/{campaign_id}/deliveries", response_model=list[DeliveryInspection],
          dependencies=[Depends(require_auth)], summary="Inspect campaign deliveries without running them.")
-def inspect_campaign_deliveries(campaign_id: int, db: Session = Depends(db_session)):
-    campaign = db.get(Campaign, campaign_id)
+def inspect_campaign_deliveries(campaign_id: int, db: Session = Depends(db_session), workspace: ClientWorkspace = Depends(current_workspace)):
+    campaign = db.scalar(select(Campaign).where(Campaign.id == campaign_id, Campaign.workspace_id == workspace.id))
     if not campaign:
         raise HTTPException(404, "Campaign not found")
     return [delivery_inspection(t) for t in sorted(campaign.touches, key=lambda touch: touch.day)]
@@ -645,8 +772,8 @@ def authorization_failures(campaign: Campaign, body: LiveAuthorizationIn, db: Se
 
 @app.post("/campaigns/{campaign_id}/authorize-live", dependencies=[Depends(require_auth)],
           summary="Explicitly authorize a campaign for future live execution.")
-def authorize_live(campaign_id: int, body: LiveAuthorizationIn, db: Session = Depends(db_session)):
-    campaign = db.get(Campaign, campaign_id)
+def authorize_live(campaign_id: int, body: LiveAuthorizationIn, db: Session = Depends(db_session), workspace: ClientWorkspace = Depends(current_workspace)):
+    campaign = db.scalar(select(Campaign).where(Campaign.id == campaign_id, Campaign.workspace_id == workspace.id))
     if not campaign:
         raise HTTPException(404, "Campaign not found")
     failures = authorization_failures(campaign, body, db)
@@ -674,8 +801,8 @@ def authorize_live(campaign_id: int, body: LiveAuthorizationIn, db: Session = De
 
 @app.get("/campaigns/{campaign_id}/safety", dependencies=[Depends(require_auth)],
          summary="Inspect live-execution safety without changing state.")
-def inspect_campaign_safety(campaign_id: int, db: Session = Depends(db_session)):
-    campaign = db.get(Campaign, campaign_id)
+def inspect_campaign_safety(campaign_id: int, db: Session = Depends(db_session), workspace: ClientWorkspace = Depends(current_workspace)):
+    campaign = db.scalar(select(Campaign).where(Campaign.id == campaign_id, Campaign.workspace_id == workspace.id))
     if not campaign:
         raise HTTPException(404, "Campaign not found")
     prospect = campaign.prospect
@@ -699,8 +826,8 @@ def inspect_campaign_safety(campaign_id: int, db: Session = Depends(db_session))
 
 @app.get("/deliveries/{delivery_id}/canary-preflight", response_model=DeliveryEligibility,
          dependencies=[Depends(require_auth)], summary="Read canary eligibility without changing state.")
-def canary_preflight(delivery_id: int, db: Session = Depends(db_session)):
-    touch = db.get(Touch, delivery_id)
+def canary_preflight(delivery_id: int, db: Session = Depends(db_session), workspace: ClientWorkspace = Depends(current_workspace)):
+    touch = db.scalar(select(Touch).where(Touch.id == delivery_id, Touch.workspace_id == workspace.id))
     if not touch:
         raise HTTPException(404, "Delivery not found")
     return can_execute_delivery(touch, touch.campaign, touch.campaign.prospect, db,
@@ -709,8 +836,8 @@ def canary_preflight(delivery_id: int, db: Session = Depends(db_session)):
 
 @app.get("/deliveries/{delivery_id}/execution", dependencies=[Depends(require_auth)],
          summary="Inspect persisted canary execution state without executing.")
-def inspect_delivery_execution(delivery_id: int, db: Session = Depends(db_session)):
-    touch = db.get(Touch, delivery_id)
+def inspect_delivery_execution(delivery_id: int, db: Session = Depends(db_session), workspace: ClientWorkspace = Depends(current_workspace)):
+    touch = db.scalar(select(Touch).where(Touch.id == delivery_id, Touch.workspace_id == workspace.id))
     if not touch:
         raise HTTPException(404, "Delivery not found")
     prospect = touch.campaign.prospect
@@ -727,14 +854,14 @@ def inspect_delivery_execution(delivery_id: int, db: Session = Depends(db_sessio
 
 @app.post("/campaigns/{campaign_id}/canary-execute", dependencies=[Depends(require_auth)],
           summary="Explicitly attempt no more than one persisted email delivery.")
-def canary_execute(campaign_id: int, body: CanaryExecutionIn, db: Session = Depends(db_session)):
+def canary_execute(campaign_id: int, body: CanaryExecutionIn, db: Session = Depends(db_session), workspace: ClientWorkspace = Depends(current_workspace)):
     """Claim exactly one explicitly named delivery; never enumerate campaign deliveries."""
-    campaign = db.get(Campaign, campaign_id)
+    campaign = db.scalar(select(Campaign).where(Campaign.id == campaign_id, Campaign.workspace_id == workspace.id))
     if not campaign:
         return JSONResponse(status_code=409, content={
             "detail": "Canary execution blocked by safety checks", "failures": ["campaign does not exist"],
         })
-    touch = db.get(Touch, body.delivery_id)
+    touch = db.scalar(select(Touch).where(Touch.id == body.delivery_id, Touch.workspace_id == workspace.id))
     if not touch:
         return JSONResponse(status_code=409, content={
             "detail": "Canary execution blocked by safety checks", "failures": ["delivery does not exist"],
@@ -801,7 +928,7 @@ def canary_execute(campaign_id: int, body: CanaryExecutionIn, db: Session = Depe
 
     # Re-load and re-check all mutable stop state immediately before the sole provider call.
     db.expire_all()
-    touch = db.get(Touch, body.delivery_id)
+    touch = db.scalar(select(Touch).where(Touch.id == body.delivery_id, Touch.workspace_id == workspace.id))
     final_check = can_execute_delivery(
         touch, touch.campaign, touch.campaign.prospect, db,
         authorized_by=body.authorized_by, confirmation=body.confirmation,
@@ -851,15 +978,16 @@ def canary_execute(campaign_id: int, body: CanaryExecutionIn, db: Session = Depe
 
 
 @app.post("/prospects/{prospect_id}/campaigns", status_code=201, dependencies=[Depends(require_auth)])
-def launch_campaign(prospect_id: int, body: CampaignIn, db: Session = Depends(db_session)):
-    p = db.get(Prospect, prospect_id)
+def launch_campaign(prospect_id: int, body: CampaignIn, db: Session = Depends(db_session), workspace: ClientWorkspace = Depends(current_workspace)):
+    p = db.scalar(select(Prospect).where(Prospect.id == prospect_id, Prospect.workspace_id == workspace.id))
     if not p:
         raise HTTPException(404, "Prospect not found")
     if not p.email_verified or not p.verified_email:
         raise HTTPException(422, "A verified email is required")
     if p.score < MIN_QUALIFICATION_SCORE:
         raise HTTPException(422, f"Qualification score must be at least {MIN_QUALIFICATION_SCORE}")
-    if db.get(Suppression, p.verified_email):
+    if db.scalar(select(Suppression).where(Suppression.workspace_id == workspace.id,
+                                           Suppression.email == p.verified_email)):
         raise HTTPException(409, "Recipient is suppressed")
     existing = db.scalar(select(Campaign).where(Campaign.prospect_id == p.id))
     if existing:
@@ -867,7 +995,7 @@ def launch_campaign(prospect_id: int, body: CampaignIn, db: Session = Depends(db
     start = body.start_at or utcnow()
     if start.tzinfo is None:
         start = start.replace(tzinfo=timezone.utc)
-    campaign = Campaign(prospect=p, starts_at=start, ends_at=start + timedelta(days=7))
+    campaign = Campaign(prospect=p, workspace_id=workspace.id, starts_at=start, ends_at=start + timedelta(days=7))
     templates = {
         0: p.opening_message or OPENING_MESSAGE_HELPERS[p.industry],
         3: "Following up with a practical way to recover missed opportunities without adding staff.",
@@ -875,7 +1003,7 @@ def launch_campaign(prospect_id: int, body: CampaignIn, db: Session = Depends(db
     }
     for day in TOUCH_DAYS:
         key = hashlib.sha256(f"{body.idempotency_key}:{p.id}:{day}".encode()).hexdigest()
-        campaign.touches.append(Touch(day=day, scheduled_at=start + timedelta(days=day),
+        campaign.touches.append(Touch(workspace_id=workspace.id, day=day, scheduled_at=start + timedelta(days=day),
                                       subject=f"Lead recovery for {p.company_name}",
                                       message=templates[day], idempotency_key=key))
     p.status, p.updated_at = "campaign_active", utcnow()
@@ -885,15 +1013,16 @@ def launch_campaign(prospect_id: int, body: CampaignIn, db: Session = Depends(db
 
 
 @app.post("/launcher/run", dependencies=[Depends(require_auth)])
-def run_launcher(now_at: datetime | None = None, db: Session = Depends(db_session)):
+def run_launcher(now_at: datetime | None = None, db: Session = Depends(db_session), workspace: ClientWorkspace = Depends(current_workspace)):
     current = now_at or utcnow()
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
-    due = list(db.scalars(select(Touch).where(Touch.status == "scheduled", Touch.scheduled_at <= current).order_by(Touch.scheduled_at)))
+    due = list(db.scalars(select(Touch).where(Touch.workspace_id == workspace.id,
+        Touch.status == "scheduled", Touch.scheduled_at <= current).order_by(Touch.scheduled_at)))
     sent = skipped = failed = 0
     for touch in due:
         p = touch.campaign.prospect
-        if touch.campaign.status != "active" or p.status in {"replied", "qualified", "converted", "suppressed"} or db.get(Suppression, p.verified_email):
+        if touch.campaign.status != "active" or p.status in {"replied", "qualified", "converted", "suppressed"} or prospect_suppressed(p, db):
             touch.status = "suppressed"
             touch.skipped = True
             touch.cancellation_or_skip_reason = "prospect suppression or campaign stop"
@@ -915,12 +1044,14 @@ def run_launcher(now_at: datetime | None = None, db: Session = Depends(db_sessio
 
 
 @app.post("/suppressions", status_code=201, dependencies=[Depends(require_auth)])
-def suppress(body: SuppressionIn, db: Session = Depends(db_session)):
-    item = db.get(Suppression, body.email)
+def suppress(body: SuppressionIn, db: Session = Depends(db_session), workspace: ClientWorkspace = Depends(current_workspace)):
+    item = db.scalar(select(Suppression).where(Suppression.workspace_id == workspace.id,
+                                               Suppression.email == body.email))
     if not item:
-        item = Suppression(email=body.email, reason=body.reason)
+        item = Suppression(workspace_id=workspace.id, email=body.email, reason=body.reason)
         db.add(item)
-    for p in db.scalars(select(Prospect).where(Prospect.verified_email == body.email)):
+    for p in db.scalars(select(Prospect).where(Prospect.workspace_id == workspace.id,
+                                               Prospect.verified_email == body.email)):
         p.status = "suppressed"
         for campaign in p.campaigns:
             campaign.status = "suppressed"
@@ -934,8 +1065,8 @@ def suppress(body: SuppressionIn, db: Session = Depends(db_session)):
 
 
 @app.post("/prospects/{prospect_id}/reply", dependencies=[Depends(require_auth)])
-def record_reply(prospect_id: int, body: ReplyIn, db: Session = Depends(db_session)):
-    p = db.get(Prospect, prospect_id)
+def record_reply(prospect_id: int, body: ReplyIn, db: Session = Depends(db_session), workspace: ClientWorkspace = Depends(current_workspace)):
+    p = db.scalar(select(Prospect).where(Prospect.id == prospect_id, Prospect.workspace_id == workspace.id))
     if not p:
         raise HTTPException(404, "Prospect not found")
     p.last_reply, p.intent = body.reply_text, body.intent
@@ -947,8 +1078,8 @@ def record_reply(prospect_id: int, body: ReplyIn, db: Session = Depends(db_sessi
 
 
 @app.post("/prospects/{prospect_id}/conversion", dependencies=[Depends(require_auth)])
-def conversion(prospect_id: int, body: ConversionIn, db: Session = Depends(db_session)):
-    p = db.get(Prospect, prospect_id)
+def conversion(prospect_id: int, body: ConversionIn, db: Session = Depends(db_session), workspace: ClientWorkspace = Depends(current_workspace)):
+    p = db.scalar(select(Prospect).where(Prospect.id == prospect_id, Prospect.workspace_id == workspace.id))
     if not p:
         raise HTTPException(404, "Prospect not found")
     p.conversion_stage = body.conversion_stage

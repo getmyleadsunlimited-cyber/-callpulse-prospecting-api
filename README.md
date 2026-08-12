@@ -30,6 +30,14 @@ healthCheck → listIndustryButtons → createProspect → launchSevenDayCampaig
 
 The service supports the business verticals exposed at `/launcher` and qualifies only prospects scoring at least 65 with independently verified business emails. Selecting a vertical supplies its CallPulse AI Website Lead Recovery opening angle. Launching a campaign creates exactly three idempotent touches for Day 0, Day 3, and Day 6 and closes the seven-day campaign on Day 7. Replies, conversions, opt-outs, hard-bounce suppressions, and other suppressions immediately stop further outreach.
 
+## Direct and agency accounts
+
+Accounts are either `direct` or `agency`. Create and inspect them with `POST/GET /accounts` and `GET /accounts/{account_id}`. An agency may own any number of client workspaces, managed through `POST/GET /accounts/{account_id}/workspaces`; `GET /workspaces/{workspace_id}` reads one workspace. Workspace metadata includes the client/business name, industry, website, status, creation time, and an optional white-label display name. Agency accounts additionally carry an agency name.
+
+Pass `X-Workspace-ID: <id>` on every prospect, campaign, delivery, suppression, reply, conversion, launcher-run, authorization, safety, and canary request. These routes resolve records inside that workspace and return `404` rather than reveal another client's resources. Prospect email uniqueness and suppressions are also workspace-local. For existing direct integrations that omit the header, the API lazily maintains a `CallPulse Direct` workspace, preserving their current request flow.
+
+The tenant layer changes ownership and query scoping only. It does **not** alter provider selection, Microsoft Graph authentication, live authorization, dry-run defaults, canary confirmation phrases, suppression enforcement, idempotency gates, or any other send-safety behavior. Creating or reading accounts/workspaces never sends email.
+
 ## Read-only campaign inspection
 
 Both inspection routes require the same `Authorization: Bearer <CALLPULSE_ACTIONS_API_KEY>` header as the write routes. `GET /prospects/{prospect_id}/campaigns` returns campaign identity, prospect and industry, status, start/end timestamps, current Day 0/3/6 sequence state, stopped state, and the current process dry-run setting. `GET /campaigns/{campaign_id}/deliveries` returns the persisted touches in sequence order with IDs, scheduling, full message, delivery status, sent timestamp, derived skipped/cancelled flags, and the opaque idempotency key. They perform reads only: neither route launches the runner, sends a message, nor commits a database transaction. A missing parent resource returns `404`.
