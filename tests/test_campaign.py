@@ -25,6 +25,15 @@ VERTICALS = [
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/test.db")
     monkeypatch.setenv("CALLPULSE_ACTIONS_API_KEY", "secret")
+    monkeypatch.setenv("CALLPULSE_TENANT_CREDENTIALS", json.dumps({
+        "agency-a-token": {"role": "agency", "workspace_id": "agency-a",
+                           "client_workspace_ids": ["client-a"]},
+        "agency-b-token": {"role": "agency", "workspace_id": "agency-b",
+                           "client_workspace_ids": ["client-b"]},
+        "client-a-token": {"role": "client", "workspace_id": "client-a"},
+        "client-b-token": {"role": "client", "workspace_id": "client-b"},
+        "direct-two-token": {"role": "direct", "workspace_id": "direct-two"},
+    }))
     import app
     importlib.reload(app)
     return TestClient(app.app)
@@ -782,6 +791,7 @@ WORKSPACE_OPERATIONS = {
     ("/campaigns/{campaign_id}/safety", "get"),
     ("/campaigns/{campaign_id}/canary-execute", "post"),
     ("/deliveries/{delivery_id}/execution", "get"),
+    ("/campaigns/{campaign_id}/canary-audits", "get"),
     ("/deliveries/{delivery_id}/canary-preflight", "get"),
     ("/launcher/run", "post"), ("/suppressions", "post"),
     ("/prospects/{prospect_id}/reply", "post"),
@@ -809,30 +819,66 @@ def test_static_openapi_references_workspace_header_on_every_tenant_operation():
         assert {"$ref": "#/components/parameters/workspaceId"} in schema["paths"][path][method]["parameters"]
 
 
-def test_workspace_ids_cannot_cross_tenant_boundaries_or_fall_back_to_direct(client):
-    workspace_a = {**headers(), "X-Workspace-ID": "agency-client-a"}
-    workspace_b = {**headers(), "X-Workspace-ID": "agency-client-b"}
-    created = client.post("/prospects", json=prospect("shared@example.com"), headers=workspace_a)
-    assert created.status_code == 201
-    prospect_id = created.json()["id"]
-    campaign = client.post(f"/prospects/{prospect_id}/campaigns",
-                           json={"idempotency_key": "workspace-a-request"}, headers=workspace_a)
-    assert campaign.status_code == 201
-    campaign_id = campaign.json()["id"]
-    delivery_id = campaign.json()["touches"][0]["id"]
+def tenant_headers(token, workspace=None):
+    result = {"Authorization": f"Bearer {token}"}
+    if workspace:
+        result["X-Workspace-ID"] = workspace
+    return result
 
-    # A foreign or omitted header resolves in that tenant only; it never finds A's IDs.
-    for request_headers in (workspace_b, headers()):
-        assert client.get(f"/prospects/{prospect_id}/campaigns", headers=request_headers).status_code == 404
-        assert client.get(f"/campaigns/{campaign_id}/deliveries", headers=request_headers).status_code == 404
-        assert client.get(f"/deliveries/{delivery_id}/execution", headers=request_headers).status_code == 404
-        assert client.post(f"/prospects/{prospect_id}/reply", json={"reply_text": "wrong tenant"},
-                           headers=request_headers).status_code == 404
 
-    assert client.get("/prospects", headers=workspace_b).json() == []
-    assert client.get("/prospects", headers=headers()).json() == []
-    # The same recipient is valid in another workspace, proving suppression/dedup are scoped.
-    assert client.post("/prospects", json=prospect("shared@example.com"), headers=workspace_b).status_code == 201
+@pytest.mark.parametrize(("token", "foreign_workspace"), [
+    ("agency-a-token", "agency-b"),
+    ("agency-a-token", "client-b"),
+    ("client-a-token", "client-b"),
+    ("secret", "direct-two"),
+])
+def test_credentials_cannot_select_foreign_workspaces(client, token, foreign_workspace):
+    response = client.get("/prospects", headers=tenant_headers(token, foreign_workspace))
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Authenticated credential is not authorized for this workspace"
+
+
+def test_agency_can_select_only_itself_and_explicitly_owned_clients(client):
+    for workspace in (None, "agency-a", "client-a"):
+        assert client.get("/prospects", headers=tenant_headers("agency-a-token", workspace)).status_code == 200
+    assert client.get("/prospects", headers=tenant_headers("agency-a-token", "client-b")).status_code == 403
+
+
+def test_foreign_ids_remain_404_inside_an_authorized_workspace(client):
+    created = client.post("/prospects", json=prospect("private@example.com"),
+                          headers=tenant_headers("client-a-token")).json()
+    response = client.get(f"/prospects/{created['id']}/campaigns",
+                          headers=tenant_headers("client-b-token"))
+    assert response.status_code == 404
+
+
+def test_every_tenant_operation_rejects_header_only_authorization_bypass(client):
+    own = tenant_headers("agency-a-token", "client-a")
+    created = client.post("/prospects", json=prospect("boundary@example.com"), headers=own).json()
+    campaign = client.post(f"/prospects/{created['id']}/campaigns",
+                           json={"idempotency_key": "boundary-request"}, headers=own).json()
+    delivery_id = campaign["touches"][0]["id"]
+    foreign = tenant_headers("agency-b-token", "client-a")
+    requests = [
+        ("get", "/prospects", {}),
+        ("post", "/prospects", {"json": prospect("other@example.com")}),
+        ("get", f"/prospects/{created['id']}/campaigns", {}),
+        ("post", f"/prospects/{created['id']}/campaigns", {"json": {"idempotency_key": "foreign-request"}}),
+        ("get", f"/campaigns/{campaign['id']}/deliveries", {}),
+        ("post", f"/campaigns/{campaign['id']}/authorize-live", {"json": {"authorized_by": "x", "confirmation": "AUTHORIZE LIVE OUTREACH"}}),
+        ("get", f"/campaigns/{campaign['id']}/safety", {}),
+        ("get", f"/deliveries/{delivery_id}/canary-preflight", {}),
+        ("get", f"/deliveries/{delivery_id}/execution", {}),
+        ("post", f"/campaigns/{campaign['id']}/canary-execute", {"json": {"delivery_id": delivery_id, "authorized_by": "x", "confirmation": "EXECUTE ONE CANARY DELIVERY"}}),
+        ("get", f"/campaigns/{campaign['id']}/canary-audits", {}),
+        ("post", "/launcher/run", {}),
+        ("post", "/suppressions", {"json": {"email": "boundary@example.com", "reason": "foreign"}}),
+        ("post", f"/prospects/{created['id']}/reply", {"json": {"reply_text": "foreign"}}),
+        ("post", f"/prospects/{created['id']}/conversion", {"json": {"conversion_stage": "converted"}}),
+    ]
+    for method, path, kwargs in requests:
+        response = client.request(method, path, headers=foreign, **kwargs)
+        assert response.status_code == 403, (method, path, response.text)
 
 
 def test_omitted_workspace_preserves_direct_account_behavior(client):

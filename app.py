@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
@@ -25,6 +26,8 @@ if DATABASE_URL.startswith("postgres://"):
 elif DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 API_KEY = os.getenv("CALLPULSE_ACTIONS_API_KEY", "")
+INTERNAL_ADMIN_API_KEY = os.getenv("CALLPULSE_INTERNAL_ADMIN_API_KEY", "")
+CREDENTIALS_JSON = os.getenv("CALLPULSE_TENANT_CREDENTIALS", "")
 DRY_RUN = os.getenv("CALLPULSE_DRY_RUN", "true").lower() != "false"
 DELIVERY_WEBHOOK = os.getenv("CALLPULSE_DELIVERY_WEBHOOK", "")
 EMAIL_PROVIDER_NAME = os.getenv("CALLPULSE_EMAIL_PROVIDER", "disabled").strip().lower()
@@ -170,31 +173,83 @@ app = FastAPI(title="CallPulse Autonomous Campaign API", version="3.0.0")
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
+@dataclass(frozen=True)
+class AuthenticatedIdentity:
+    """The tenant authorization grants bound to one bearer credential."""
+    role: Literal["direct", "agency", "client", "internal_admin"]
+    workspace_id: str
+    client_workspace_ids: frozenset[str] = frozenset()
+
+    def permits(self, workspace_id: str) -> bool:
+        if self.role == "internal_admin":
+            return True
+        if workspace_id == self.workspace_id:
+            return True
+        return self.role == "agency" and workspace_id in self.client_workspace_ids
+
+
+def load_tenant_credentials(raw: str) -> dict[str, AuthenticatedIdentity]:
+    """Parse credential grants once at startup; malformed grants fail closed."""
+    if not raw.strip():
+        return {}
+    try:
+        configured = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("CALLPULSE_TENANT_CREDENTIALS must be valid JSON") from exc
+    if not isinstance(configured, dict):
+        raise RuntimeError("CALLPULSE_TENANT_CREDENTIALS must be a JSON object")
+    identities: dict[str, AuthenticatedIdentity] = {}
+    for token, grant in configured.items():
+        if not isinstance(token, str) or not token or not isinstance(grant, dict):
+            raise RuntimeError("Every tenant credential must have a non-empty token and object grant")
+        role, workspace_id = grant.get("role"), grant.get("workspace_id")
+        clients = grant.get("client_workspace_ids", [])
+        if role not in {"direct", "agency", "client"} or not isinstance(workspace_id, str) or not workspace_id:
+            raise RuntimeError("Tenant credential role/workspace_id is invalid")
+        if not isinstance(clients, list) or any(not isinstance(item, str) or not item for item in clients):
+            raise RuntimeError("client_workspace_ids must be an array of non-empty strings")
+        if role != "agency" and clients:
+            raise RuntimeError("Only agency credentials may grant client workspaces")
+        identities[token] = AuthenticatedIdentity(role, workspace_id, frozenset(clients))
+    return identities
+
+
+TENANT_CREDENTIALS = load_tenant_credentials(CREDENTIALS_JSON)
+
+
 def db_session():
     with SessionLocal() as db:
         yield db
 
 
-def require_auth(credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme)):
-    if (
-        not API_KEY
-        or credentials is None
-        or credentials.scheme.lower() != "bearer"
-        or not hmac.compare_digest(credentials.credentials, API_KEY)
-    ):
+def require_auth(credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme)) -> AuthenticatedIdentity:
+    if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(401, "Valid bearer authentication is required")
+    supplied = credentials.credentials
+    # The legacy credential is deliberately a Direct-account credential, never a
+    # global tenant selector. The separate admin secret is for internal operators only.
+    if API_KEY and hmac.compare_digest(supplied, API_KEY):
+        return AuthenticatedIdentity("direct", DEFAULT_WORKSPACE_ID)
+    if INTERNAL_ADMIN_API_KEY and hmac.compare_digest(supplied, INTERNAL_ADMIN_API_KEY):
+        return AuthenticatedIdentity("internal_admin", DEFAULT_WORKSPACE_ID)
+    for token, identity in TENANT_CREDENTIALS.items():
+        if hmac.compare_digest(supplied, token):
+            return identity
+    raise HTTPException(401, "Valid bearer authentication is required")
 
 
 def workspace_context(x_workspace_id: str | None = Header(
     default=None, alias="X-Workspace-ID",
-    description="Tenant workspace. Omit only for the CallPulse Direct account.",
-)) -> str:
-    """Resolve tenant context while retaining the legacy Direct-account default."""
+    description="Select a workspace already authorized by the bearer credential; this header grants no access.",
+), identity: AuthenticatedIdentity = Depends(require_auth)) -> str:
+    """Resolve and authorize tenant context before any tenant data is queried."""
     if x_workspace_id is None:
-        return DEFAULT_WORKSPACE_ID
+        return identity.workspace_id
     workspace_id = x_workspace_id.strip()
     if not workspace_id or len(workspace_id) > 100 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", workspace_id):
         raise HTTPException(400, "X-Workspace-ID is invalid")
+    if not identity.permits(workspace_id):
+        raise HTTPException(403, "Authenticated credential is not authorized for this workspace")
     return workspace_id
 
 
@@ -756,6 +811,19 @@ def inspect_delivery_execution(delivery_id: int, workspace_id: str = Depends(wor
         "idempotency_key": touch.idempotency_key, "sender": EMAIL_FROM or None,
         "recipient": prospect.verified_email, "last_execution_error": touch.last_execution_error,
     }
+
+
+@app.get("/campaigns/{campaign_id}/canary-audits", dependencies=[Depends(require_auth)],
+         summary="Inspect non-secret canary audit records without executing.")
+def inspect_canary_audits(campaign_id: int, workspace_id: str = Depends(workspace_context),
+                          db: Session = Depends(db_session)):
+    campaign = scoped_campaign(db, campaign_id, workspace_id)
+    if not campaign:
+        raise HTTPException(404, "Campaign not found")
+    audits = db.scalars(select(CanaryExecutionAudit).where(
+        CanaryExecutionAudit.campaign_id == campaign.id).order_by(CanaryExecutionAudit.id))
+    return [{column.name: getattr(audit, column.name)
+             for column in audit.__table__.columns} for audit in audits]
 
 
 @app.post("/campaigns/{campaign_id}/canary-execute", dependencies=[Depends(require_auth)],
