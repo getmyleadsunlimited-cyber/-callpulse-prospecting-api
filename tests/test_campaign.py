@@ -33,6 +33,33 @@ def client(tmp_path, monkeypatch):
 def headers(): return {"Authorization": "Bearer secret"}
 
 
+def workspace_headers(workspace_id):
+    return {**headers(), "X-Workspace-ID": str(workspace_id)}
+
+
+def test_agency_client_workspaces_isolate_prospects_and_campaigns(client):
+    agency_one = client.post("/accounts", json={"account_type": "agency", "agency_name": "Northstar"}, headers=headers()).json()
+    agency_two = client.post("/accounts", json={"account_type": "agency", "agency_name": "Rival"}, headers=headers()).json()
+    client_one = client.post(f"/accounts/{agency_one['id']}/workspaces", json={
+        "client_business_name": "Alpha Roofing", "industry": "Roofing", "website": "https://alpha.example",
+        "white_label_display_name": "Northstar Leads"}, headers=headers()).json()
+    client_two = client.post(f"/accounts/{agency_two['id']}/workspaces", json={
+        "client_business_name": "Beta HVAC", "industry": "HVAC", "website": "https://beta.example"}, headers=headers()).json()
+
+    first = client.post("/prospects", json=prospect("shared@example.com"), headers=workspace_headers(client_one["id"]))
+    second = client.post("/prospects", json=prospect("shared@example.com"), headers=workspace_headers(client_two["id"]))
+    assert first.status_code == second.status_code == 201  # uniqueness is tenant-local
+    campaign = client.post(f"/prospects/{first.json()['id']}/campaigns",
+                           json={"idempotency_key": "tenant-one-123"}, headers=workspace_headers(client_one["id"]))
+    assert campaign.status_code == 201
+
+    assert client.get("/prospects", headers=workspace_headers(client_two["id"])).json() == [second.json()]
+    assert client.get(f"/prospects/{first.json()['id']}/campaigns", headers=workspace_headers(client_two["id"])).status_code == 404
+    assert client.get(f"/campaigns/{campaign.json()['id']}/deliveries", headers=workspace_headers(client_two["id"])).status_code == 404
+    assert client.post(f"/prospects/{first.json()['id']}/reply", json={"reply_text": "hidden"},
+                       headers=workspace_headers(client_two["id"])).status_code == 404
+
+
 def prospect(email="verified@example.com", verified=True):
     return {"company_name": "Example Agency", "website": "https://example.com", "industry": "Final Expense", "score": 91,
             "why_now": "Missed calls", "ai_recovery_opportunity": "Immediate callbacks", "verified_email": email,
@@ -62,6 +89,12 @@ def test_openapi_uses_http_bearer_security_for_protected_endpoints(client):
     }
 
     protected_operations = {
+        ("/accounts", "get"),
+        ("/accounts", "post"),
+        ("/accounts/{account_id}", "get"),
+        ("/accounts/{account_id}/workspaces", "get"),
+        ("/accounts/{account_id}/workspaces", "post"),
+        ("/workspaces/{workspace_id}", "get"),
         ("/industries", "get"),
         ("/email-provider/status", "get"),
         ("/prospects", "get"),

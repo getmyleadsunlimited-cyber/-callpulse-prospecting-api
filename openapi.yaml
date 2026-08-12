@@ -2,11 +2,40 @@ openapi: 3.1.0
 info:
   title: CallPulse Autonomous Campaign API
   version: 3.0.0
-  description: Verified-email, suppression-aware autonomous seven-day outreach on days 0, 3, and 6.
+  description: Workspace-isolated, verified-email, suppression-aware autonomous seven-day outreach on days 0, 3, and 6. Tenant-scoped operations accept X-Workspace-ID; omission retains the legacy direct workspace.
 servers:
   - url: https://callpulse-prospecting-api.onrender.com
 security: [{bearerAuth: []}]
 paths:
+  /accounts:
+    get:
+      operationId: listAccounts
+      parameters: [{in: query, name: account_type, schema: {type: string, enum: [direct, agency]}}]
+      responses: {'200': {description: Direct and agency account list}}
+    post:
+      operationId: createAccount
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AccountInput'}}}}
+      responses: {'201': {description: Account created; no email is sent}}
+  /accounts/{account_id}:
+    get:
+      operationId: readAccount
+      parameters: [{$ref: '#/components/parameters/accountId'}]
+      responses: {'200': {description: Account metadata}, '404': {description: Account not found}}
+  /accounts/{account_id}/workspaces:
+    get:
+      operationId: listClientWorkspaces
+      parameters: [{$ref: '#/components/parameters/accountId'}]
+      responses: {'200': {description: Client workspace list}}
+    post:
+      operationId: createClientWorkspace
+      parameters: [{$ref: '#/components/parameters/accountId'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceInput'}}}}
+      responses: {'201': {description: Client workspace created; no email is sent}, '404': {description: Account not found}}
+  /workspaces/{workspace_id}:
+    get:
+      operationId: readClientWorkspace
+      parameters: [{$ref: '#/components/parameters/workspaceId'}]
+      responses: {'200': {description: Client workspace metadata}, '404': {description: Workspace not found}}
   /health:
     get:
       security: []
@@ -201,10 +230,29 @@ components:
   securitySchemes:
     bearerAuth: {type: http, scheme: bearer}
   parameters:
+    accountId: {in: path, name: account_id, required: true, schema: {type: integer}}
+    workspaceId: {in: path, name: workspace_id, required: true, schema: {type: integer}}
+    workspaceHeader: {in: header, name: X-Workspace-ID, required: false, description: Tenant scope; omission selects the legacy direct workspace., schema: {type: integer}}
     prospectId: {in: path, name: prospect_id, required: true, schema: {type: integer}}
     campaignId: {in: path, name: campaign_id, required: true, schema: {type: integer}}
     deliveryId: {in: path, name: delivery_id, required: true, schema: {type: integer}}
   schemas:
+    AccountInput:
+      type: object
+      required: [account_type]
+      properties:
+        account_type: {type: string, enum: [direct, agency]}
+        agency_name: {type: [string, 'null'], maxLength: 200, description: Required when account_type is agency.}
+        status: {type: string, default: active, maxLength: 40}
+    WorkspaceInput:
+      type: object
+      required: [client_business_name]
+      properties:
+        client_business_name: {type: string, maxLength: 200}
+        industry: {type: [string, 'null'], maxLength: 100}
+        website: {type: [string, 'null'], format: uri, maxLength: 500}
+        status: {type: string, default: active, maxLength: 40}
+        white_label_display_name: {type: [string, 'null'], maxLength: 200}
     CampaignSequenceState:
       type: object
       required: [day, status, scheduled_at, sent_at]
