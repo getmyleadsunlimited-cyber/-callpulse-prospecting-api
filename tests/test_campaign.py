@@ -826,6 +826,61 @@ def tenant_headers(token, workspace=None):
     return result
 
 
+def test_workspace_id_validation_accepts_the_shared_header_and_config_grammar(client):
+    import app
+    valid_ids = ["a", "Agency-7", "client_8", "region.us:customer-9", "x" * 100]
+    for workspace_id in valid_ids:
+        assert app.validate_workspace_id(workspace_id) == workspace_id
+        credentials = app.load_tenant_credentials(json.dumps({
+            "token": {"role": "agency", "workspace_id": workspace_id,
+                      "client_workspace_ids": valid_ids},
+        }))
+        assert credentials["token"].workspace_id == workspace_id
+        assert credentials["token"].client_workspace_ids == frozenset(valid_ids)
+
+
+@pytest.mark.parametrize("workspace_id", [
+    "", " leading", "trailing ", "embedded space", "tab\tid", "line\nid",
+    "unsupported/id", "question?", "x" * 101,
+])
+def test_malformed_workspace_ids_fail_in_headers_and_primary_grants(client, workspace_id):
+    import app
+    with pytest.raises(ValueError, match="Workspace ID is invalid"):
+        app.validate_workspace_id(workspace_id)
+    with pytest.raises(RuntimeError, match="role/workspace_id is invalid"):
+        app.load_tenant_credentials(json.dumps({
+            "token": {"role": "direct", "workspace_id": workspace_id},
+        }))
+    identity = app.AuthenticatedIdentity("agency", "agency-a", frozenset({"client-a"}))
+    with pytest.raises(app.HTTPException) as exc_info:
+        app.workspace_context(workspace_id, identity)
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "X-Workspace-ID is invalid"
+
+
+@pytest.mark.parametrize("clients", [
+    "client-a", None, {}, [""], ["client-a", "bad client"],
+    ["client-a", "x" * 101], ["client-a", 7],
+])
+def test_malformed_client_workspace_lists_fail_closed(client, clients):
+    import app
+    with pytest.raises(RuntimeError, match="client_workspace_ids"):
+        app.load_tenant_credentials(json.dumps({
+            "token": {"role": "agency", "workspace_id": "agency-a",
+                      "client_workspace_ids": clients},
+        }))
+
+
+def test_one_invalid_workspace_rejects_mixed_tenant_grants(client):
+    import app
+    with pytest.raises(RuntimeError, match="client_workspace_ids"):
+        app.load_tenant_credentials(json.dumps({
+            "valid-token": {"role": "direct", "workspace_id": "valid-workspace"},
+            "invalid-token": {"role": "agency", "workspace_id": "valid-agency",
+                              "client_workspace_ids": ["valid-client", "invalid client"]},
+        }))
+
+
 @pytest.mark.parametrize(("token", "foreign_workspace"), [
     ("agency-a-token", "agency-b"),
     ("agency-a-token", "client-b"),
