@@ -772,3 +772,70 @@ def test_graph_auth_secret_never_reaches_execution_state_logs_or_audit(client, m
     assert "AADSTS7000215: Invalid client secret" in retained
     assert secret not in observable
     assert all(encoded not in observable for encoded in encoded_variants)
+
+WORKSPACE_OPERATIONS = {
+    ("/prospects", "get"), ("/prospects", "post"),
+    ("/prospects/{prospect_id}/campaigns", "get"),
+    ("/prospects/{prospect_id}/campaigns", "post"),
+    ("/campaigns/{campaign_id}/deliveries", "get"),
+    ("/campaigns/{campaign_id}/authorize-live", "post"),
+    ("/campaigns/{campaign_id}/safety", "get"),
+    ("/campaigns/{campaign_id}/canary-execute", "post"),
+    ("/deliveries/{delivery_id}/execution", "get"),
+    ("/deliveries/{delivery_id}/canary-preflight", "get"),
+    ("/launcher/run", "post"), ("/suppressions", "post"),
+    ("/prospects/{prospect_id}/reply", "post"),
+    ("/prospects/{prospect_id}/conversion", "post"),
+}
+
+
+def _has_workspace_header(operation):
+    return any(parameter.get("name") == "X-Workspace-ID" and parameter.get("in") == "header"
+               for parameter in operation.get("parameters", []))
+
+
+def test_runtime_openapi_exposes_workspace_header_on_every_tenant_operation(client):
+    schema = client.get("/openapi.json").json()
+    for path, method in WORKSPACE_OPERATIONS:
+        assert _has_workspace_header(schema["paths"][path][method]), (path, method)
+
+
+def test_static_openapi_references_workspace_header_on_every_tenant_operation():
+    import yaml
+    schema = yaml.safe_load(Path("openapi.yaml").read_text())
+    parameter = schema["components"]["parameters"]["workspaceId"]
+    assert parameter["name"] == "X-Workspace-ID" and parameter["in"] == "header"
+    for path, method in WORKSPACE_OPERATIONS:
+        assert {"$ref": "#/components/parameters/workspaceId"} in schema["paths"][path][method]["parameters"]
+
+
+def test_workspace_ids_cannot_cross_tenant_boundaries_or_fall_back_to_direct(client):
+    workspace_a = {**headers(), "X-Workspace-ID": "agency-client-a"}
+    workspace_b = {**headers(), "X-Workspace-ID": "agency-client-b"}
+    created = client.post("/prospects", json=prospect("shared@example.com"), headers=workspace_a)
+    assert created.status_code == 201
+    prospect_id = created.json()["id"]
+    campaign = client.post(f"/prospects/{prospect_id}/campaigns",
+                           json={"idempotency_key": "workspace-a-request"}, headers=workspace_a)
+    assert campaign.status_code == 201
+    campaign_id = campaign.json()["id"]
+    delivery_id = campaign.json()["touches"][0]["id"]
+
+    # A foreign or omitted header resolves in that tenant only; it never finds A's IDs.
+    for request_headers in (workspace_b, headers()):
+        assert client.get(f"/prospects/{prospect_id}/campaigns", headers=request_headers).status_code == 404
+        assert client.get(f"/campaigns/{campaign_id}/deliveries", headers=request_headers).status_code == 404
+        assert client.get(f"/deliveries/{delivery_id}/execution", headers=request_headers).status_code == 404
+        assert client.post(f"/prospects/{prospect_id}/reply", json={"reply_text": "wrong tenant"},
+                           headers=request_headers).status_code == 404
+
+    assert client.get("/prospects", headers=workspace_b).json() == []
+    assert client.get("/prospects", headers=headers()).json() == []
+    # The same recipient is valid in another workspace, proving suppression/dedup are scoped.
+    assert client.post("/prospects", json=prospect("shared@example.com"), headers=workspace_b).status_code == 201
+
+
+def test_omitted_workspace_preserves_direct_account_behavior(client):
+    created = client.post("/prospects", json=prospect("direct@example.com"), headers=headers())
+    assert created.status_code == 201
+    assert client.get("/prospects", headers=headers()).json()[0]["id"] == created.json()["id"]
