@@ -2,7 +2,10 @@ openapi: 3.1.0
 info:
   title: CallPulse Autonomous Campaign API
   version: 3.0.0
-  description: Verified-email, suppression-aware autonomous seven-day outreach on days 0, 3, and 6.
+  description: >-
+    Verified-email, suppression-aware autonomous seven-day outreach. Bearer credentials are bound to
+    direct, agency, or client workspace grants. X-Workspace-ID only selects an already-authorized grant;
+    a foreign selection returns 403 and foreign resource IDs within an authorized workspace remain 404.
 servers:
   - url: https://callpulse-prospecting-api.onrender.com
 security: [{bearerAuth: []}]
@@ -155,6 +158,15 @@ paths:
       responses:
         '200': {description: Structured eligibility decision and all failures}
         '404': {description: Delivery not found}
+  /campaigns/{campaign_id}/canary-audits:
+    get:
+      operationId: inspectCanaryAudits
+      summary: Read non-secret canary audit records within the authorized workspace.
+      parameters: [{$ref: '#/components/parameters/campaignId'}, {$ref: '#/components/parameters/workspaceId'}]
+      responses:
+        '200': {description: Canary audit records for the tenant-scoped campaign}
+        '403': {description: Credential is not authorized for the selected workspace}
+        '404': {description: Campaign not found in the authorized workspace}
   /launcher/run:
     post:
       operationId: runDueCampaignTouches
@@ -213,8 +225,8 @@ components:
       in: header
       name: X-Workspace-ID
       required: false
-      description: Tenant workspace. Omit only for the backward-compatible CallPulse Direct account.
-      schema: {type: string, default: callpulse-direct}
+      description: Selects only a workspace already granted to the bearer credential; never grants access. Omission selects the credential's own workspace.
+      schema: {type: string}
   schemas:
     CampaignSequenceState:
       type: object

@@ -9,6 +9,10 @@ services:
     envVars:
       - key: CALLPULSE_ACTIONS_API_KEY
         generateValue: true
+      - key: CALLPULSE_TENANT_CREDENTIALS
+        sync: false
+      - key: CALLPULSE_INTERNAL_ADMIN_API_KEY
+        sync: false
       - key: DATABASE_URL
         sync: false
       - key: CALLPULSE_DRY_RUN

@@ -15,25 +15,28 @@ Use this package to test your GPT Actions on Render's free web-service tier.
 ## GPT Action
 Open CallPulse.org Prospecting Agent → Configure → Actions → Create new action.
 
-Authentication:
-API Key / Bearer
-
-Use the value Render generated for:
-CALLPULSE_ACTIONS_API_KEY
+Authentication uses a bearer credential whose tenant grants are configured by the service (never by the request).
 
 Paste the updated openapi.yaml as the schema.
 
 Test:
 healthCheck → listIndustryButtons → createProspect → launchSevenDayCampaign → inspectProspectCampaigns → inspectCampaignDeliveries → runDueCampaignTouches → recordReplyAndStopCampaign → recordConversion
 
-### Workspace context
+### Authentication and workspace authorization
 
-Send `X-Workspace-ID: <client-workspace>` on every prospect, campaign, delivery,
-suppression, runner, reply, and conversion operation performed for an agency
-client. Resource IDs and recipient suppressions are resolved only inside that
-workspace. Omitting the header selects the legacy `callpulse-direct` workspace
-and is supported only for backward-compatible CallPulse Direct integrations;
-agency/client integrations must always send their client's workspace ID.
+`X-Workspace-ID` is only a selector among grants already bound to the authenticated bearer credential; it is never authorization by itself. Configure customer credentials with `CALLPULSE_TENANT_CREDENTIALS`, a JSON object keyed by secret bearer token:
+
+```json
+{
+  "direct-secret": {"role": "direct", "workspace_id": "direct-42"},
+  "agency-secret": {"role": "agency", "workspace_id": "agency-7", "client_workspace_ids": ["client-8", "client-9"]},
+  "client-secret": {"role": "client", "workspace_id": "client-8"}
+}
+```
+
+A direct or client credential can use only its own workspace. An agency credential can use its agency workspace and only the client workspaces explicitly listed in its grant. Omitting `X-Workspace-ID` selects the credential's own workspace; supplying a foreign workspace returns `403`. Once a workspace is authorized, IDs are looked up only in that workspace, so missing or foreign resource IDs return `404` to limit tenant enumeration. This boundary applies uniformly to prospects, campaigns, deliveries, suppressions, replies, conversions, canary execution/audits, and the runner.
+
+The legacy `CALLPULSE_ACTIONS_API_KEY` is retained solely as a direct credential for `callpulse-direct`; it cannot switch tenants. `CALLPULSE_INTERNAL_ADMIN_API_KEY` is an optional, separate unrestricted internal-admin credential and must never be issued to an agency, client, or direct customer.
 
 ## Production campaign
 
@@ -41,7 +44,7 @@ The service supports the business verticals exposed at `/launcher` and qualifies
 
 ## Read-only campaign inspection
 
-Both inspection routes require the same `Authorization: Bearer <CALLPULSE_ACTIONS_API_KEY>` header as the write routes. `GET /prospects/{prospect_id}/campaigns` returns campaign identity, prospect and industry, status, start/end timestamps, current Day 0/3/6 sequence state, stopped state, and the current process dry-run setting. `GET /campaigns/{campaign_id}/deliveries` returns the persisted touches in sequence order with IDs, scheduling, full message, delivery status, sent timestamp, derived skipped/cancelled flags, and the opaque idempotency key. They perform reads only: neither route launches the runner, sends a message, nor commits a database transaction. A missing parent resource returns `404`.
+Both inspection routes require an authorized bearer credential. `GET /prospects/{prospect_id}/campaigns` returns campaign identity, prospect and industry, status, start/end timestamps, current Day 0/3/6 sequence state, stopped state, and the current process dry-run setting. `GET /campaigns/{campaign_id}/deliveries` returns the persisted touches in sequence order with IDs, scheduling, full message, delivery status, sent timestamp, derived skipped/cancelled flags, and the opaque idempotency key. They perform reads only: neither route launches the runner, sends a message, nor commits a database transaction. A missing parent resource returns `404`.
 
 The schema persists campaign and delivery dry-run state, explicit live authorization audit fields, stable delivery idempotency keys, and delivery cancellation/skip reasons. Inspection responses never include API keys, delivery-provider credentials, database URLs, or access tokens.
 
@@ -55,7 +58,7 @@ An authenticated operator must call `POST /campaigns/{campaign_id}/authorize-liv
 
 `GET /campaigns/{campaign_id}/safety` provides a read-only safety and eligibility summary. A later suppression remains an absolute stop: future deliveries are skipped with a persisted suppression reason while sent history is retained. **Authorization only establishes eligibility for a future executor; it does not send email, SMS, calls, or social messages.** This API does not invoke a messaging provider as part of authorization or safety inspection.
 
-Set `DATABASE_URL` to PostgreSQL. Render runs `python migrate.py` before every API start, applying each pending SQL migration transactionally and checking every SQLAlchemy model table and column before serving traffic. Set a strong `CALLPULSE_ACTIONS_API_KEY`; authentication fails closed when it is missing. New campaigns are safe by default regardless of process configuration. No messaging-provider setup is part of this safety-gate release.
+Set `DATABASE_URL` to PostgreSQL. Render runs `python migrate.py` before every API start, applying each pending SQL migration transactionally and checking every SQLAlchemy model table and column before serving traffic. Configure strong, unique tenant credentials; authentication fails closed when no configured credential matches. New campaigns are safe by default regardless of process configuration. No messaging-provider setup is part of this safety-gate release.
 
 ## Canary Live Execution
 
