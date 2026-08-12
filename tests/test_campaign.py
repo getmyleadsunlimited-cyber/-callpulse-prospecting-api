@@ -684,6 +684,57 @@ def test_graph_auth_diagnostic_redacts_raw_and_encoded_client_secret(monkeypatch
     assert secret not in diagnostic and encoded not in diagnostic
 
 
+@pytest.mark.parametrize("payload", [
+    b'["client-secret-must-not-escape"]',
+    b'"client-secret-must-not-escape"',
+    b"42",
+    b"null",
+    b'{"error":',
+])
+def test_graph_auth_diagnostic_safely_classifies_non_object_json(monkeypatch, payload):
+    import email_providers
+
+    def auth_failure(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {},
+                                     io.BytesIO(payload))
+
+    email_providers.MicrosoftGraphEmailProvider._token_cache.clear()
+    monkeypatch.setattr(email_providers.urllib.request, "urlopen", auth_failure)
+    provider = email_providers.MicrosoftGraphEmailProvider(
+        "tenant", "client", "client-secret-must-not-escape")
+    with pytest.raises(email_providers.EmailProviderError) as raised:
+        provider.send(sender="approved@example.com", recipient="recipient@example.com",
+                      subject="subject", message="body", idempotency_key="key")
+
+    assert str(raised.value) == "microsoft graph authentication failed (HTTP 403)"
+
+
+def test_graph_auth_diagnostic_classifies_normal_microsoft_error_object(monkeypatch):
+    import email_providers
+    payload = json.dumps({
+        "error": "invalid_client",
+        "error_description": (
+            "AADSTS7000215: Invalid client secret was provided. Trace ID: safe-trace"
+        ),
+    }).encode()
+
+    def auth_failure(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {},
+                                     io.BytesIO(payload))
+
+    email_providers.MicrosoftGraphEmailProvider._token_cache.clear()
+    monkeypatch.setattr(email_providers.urllib.request, "urlopen", auth_failure)
+    provider = email_providers.MicrosoftGraphEmailProvider("tenant", "client", "secret")
+    with pytest.raises(email_providers.EmailProviderError) as raised:
+        provider.send(sender="approved@example.com", recipient="recipient@example.com",
+                      subject="subject", message="body", idempotency_key="key")
+
+    assert str(raised.value) == (
+        "microsoft graph authentication failed (HTTP 401, invalid_client, "
+        "AADSTS7000215: Invalid client secret was provided.)"
+    )
+
+
 def test_graph_auth_secret_never_reaches_execution_state_logs_or_audit(client, monkeypatch, caplog):
     import app
     import email_providers
