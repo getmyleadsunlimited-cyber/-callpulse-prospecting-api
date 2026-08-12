@@ -2,6 +2,7 @@ import importlib
 import json
 import re
 import subprocess
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -66,6 +67,9 @@ def test_openapi_uses_http_bearer_security_for_protected_endpoints(client):
         ("/campaigns/{campaign_id}/deliveries", "get"),
         ("/campaigns/{campaign_id}/authorize-live", "post"),
         ("/campaigns/{campaign_id}/safety", "get"),
+        ("/campaigns/{campaign_id}/canary-execute", "post"),
+        ("/deliveries/{delivery_id}/execution", "get"),
+        ("/deliveries/{delivery_id}/canary-preflight", "get"),
         ("/launcher/run", "post"),
         ("/suppressions", "post"),
         ("/prospects/{prospect_id}/reply", "post"),
@@ -294,6 +298,8 @@ def test_inspection_fields_match_the_existing_persisted_campaign_schema(client):
     assert touch_columns == {
         "id", "campaign_id", "day", "scheduled_at", "status", "message", "idempotency_key", "sent_at",
         "dry_run", "skipped", "cancelled", "cancellation_or_skip_reason",
+        "execution_status", "execution_started_at", "execution_completed_at", "provider_name",
+        "provider_message_id", "last_execution_error", "execution_attempt_count",
     }
     assert {"created_at", "stop_reason"}.isdisjoint(campaign_columns)
     assert {"cancellation_reason", "skip_reason"}.isdisjoint(touch_columns)
@@ -325,6 +331,162 @@ def authorize(client, campaign_id, authorized_by="safety officer", confirmation=
         f"/campaigns/{campaign_id}/authorize-live",
         json={"authorized_by": authorized_by, "confirmation": confirmation}, headers=headers(),
     )
+
+
+def execute_canary(client, campaign, delivery_id=None, authorized_by="operator",
+                   confirmation="EXECUTE ONE CANARY DELIVERY"):
+    return client.post(f"/campaigns/{campaign['id']}/canary-execute", json={
+        "authorized_by": authorized_by, "confirmation": confirmation,
+        "delivery_id": delivery_id or campaign["touches"][0]["id"],
+    }, headers=headers())
+
+
+def configure_mock(app_module, monkeypatch):
+    monkeypatch.setattr(app_module, "EMAIL_PROVIDER_NAME", "mock")
+    monkeypatch.setattr(app_module, "EMAIL_FROM", "approved-sender@example.com")
+    from email_providers import DeterministicMockEmailProvider
+    DeterministicMockEmailProvider.calls.clear()
+    return DeterministicMockEmailProvider
+
+
+def test_canary_auth_body_and_campaign_safety_fail_closed(client, monkeypatch):
+    import app
+    _, campaign = launch(client, "canary-blocked@example.com")
+    configure_mock(app, monkeypatch)
+    url = f"/campaigns/{campaign['id']}/canary-execute"
+    valid = {"authorized_by": "operator", "confirmation": "EXECUTE ONE CANARY DELIVERY",
+             "delivery_id": campaign["touches"][0]["id"]}
+    assert client.post(url, json=valid).status_code == 401
+    assert client.post(url, json={**valid, "confirmation": "yes"}, headers=headers()).status_code == 409
+    assert client.post(url, json={**valid, "authorized_by": " "}, headers=headers()).status_code == 409
+    assert client.post(url, json={"authorized_by": "operator", "confirmation": valid["confirmation"]},
+                       headers=headers()).status_code == 422
+    response = client.post(url, json=valid, headers=headers())
+    assert response.status_code == 409
+    assert "campaign is not live authorized" in response.json()["failures"]
+
+
+def test_disabled_provider_and_missing_sender_never_send(client, monkeypatch):
+    import app
+    _, campaign = launch(client, "disabled@example.com", datetime.now(timezone.utc) - timedelta(minutes=1))
+    assert authorize(client, campaign["id"]).status_code == 200
+    monkeypatch.setattr(app, "EMAIL_FROM", "")
+    assert execute_canary(client, campaign).status_code == 409
+    monkeypatch.setattr(app, "EMAIL_FROM", "approved@example.com")
+    monkeypatch.setattr(app, "EMAIL_PROVIDER_NAME", "disabled")
+    assert execute_canary(client, campaign).status_code == 503
+
+
+def test_mock_canary_sends_exactly_one_and_retry_is_idempotent(client, monkeypatch):
+    import app
+    provider_class = configure_mock(app, monkeypatch)
+    _, campaign = launch(client, "one@example.com", datetime.now(timezone.utc) - timedelta(minutes=1))
+    original_key = campaign["touches"][0]["idempotency_key"]
+    assert authorize(client, campaign["id"]).status_code == 200
+    first = execute_canary(client, campaign)
+    second = execute_canary(client, campaign)
+    assert first.status_code == second.status_code == 200
+    assert first.json()["already_executed"] is False
+    assert second.json()["already_executed"] is True
+    assert len(provider_class.calls) == 1
+    assert provider_class.calls[0]["message"] == campaign["touches"][0]["message"]
+    assert provider_class.calls[0]["idempotency_key"] == original_key
+    execution = client.get(f"/deliveries/{campaign['touches'][0]['id']}/execution", headers=headers()).json()
+    assert execution["execution_status"] == "sent" and execution["attempt_count"] == 1
+    assert execution["sent_at"] and execution["provider_message_id"].startswith("mock-")
+    assert execution["idempotency_key"] == original_key
+    # No implicit Day 3/6 activity.
+    later = [client.get(f"/deliveries/{item['id']}/execution", headers=headers()).json()
+             for item in campaign["touches"][1:]]
+    assert all(item["execution_status"] == "pending" and item["attempt_count"] == 0 for item in later)
+
+
+def test_canary_preflight_and_execution_inspection_are_read_only(client, monkeypatch):
+    import app
+    configure_mock(app, monkeypatch)
+    _, campaign = launch(client, "preflight@example.com")
+    delivery_id = campaign["touches"][0]["id"]
+    with app.engine.connect() as connection:
+        before = connection.exec_driver_sql("SELECT * FROM campaign_touches WHERE id = ?", (delivery_id,)).mappings().one()
+    assert client.get(f"/deliveries/{delivery_id}/canary-preflight", headers=headers()).status_code == 200
+    assert client.get(f"/deliveries/{delivery_id}/execution", headers=headers()).status_code == 200
+    with app.engine.connect() as connection:
+        after = connection.exec_driver_sql("SELECT * FROM campaign_touches WHERE id = ?", (delivery_id,)).mappings().one()
+    assert before == after
+
+
+@pytest.mark.parametrize("field, expected", [
+    ("skipped", "delivery is skipped"), ("cancelled", "delivery is cancelled"),
+])
+def test_canary_rejects_skipped_or_cancelled_delivery(client, monkeypatch, field, expected):
+    import app
+    provider_class = configure_mock(app, monkeypatch)
+    _, campaign = launch(client, f"{field}@example.com", datetime.now(timezone.utc) - timedelta(minutes=1))
+    assert authorize(client, campaign["id"]).status_code == 200
+    with app.SessionLocal() as db:
+        touch = db.get(app.Touch, campaign["touches"][0]["id"])
+        setattr(touch, field, True)
+        db.commit()
+    response = execute_canary(client, campaign)
+    assert response.status_code == 409 and expected in response.json()["failures"]
+    assert provider_class.calls == []
+
+
+def test_provider_failure_is_persisted_without_retry_or_sent_at(client, monkeypatch):
+    import app
+    configure_mock(app, monkeypatch)
+    _, campaign = launch(client, "failure@example.com", datetime.now(timezone.utc) - timedelta(minutes=1))
+    assert authorize(client, campaign["id"]).status_code == 200
+
+    class FailingProvider:
+        name = "mock"
+        calls = 0
+        def send(self, **kwargs):
+            self.calls += 1
+            raise RuntimeError("secret provider detail")
+
+    provider = FailingProvider()
+    monkeypatch.setattr(app, "configured_provider", lambda *args: provider)
+    response = execute_canary(client, campaign)
+    assert response.status_code == 502 and provider.calls == 1
+    state = client.get(f"/deliveries/{campaign['touches'][0]['id']}/execution", headers=headers()).json()
+    assert state["execution_status"] == "failed" and state["attempt_count"] == 1
+    assert state["sent_at"] is None and "secret provider detail" not in state["last_execution_error"]
+    # The service has no automatic provider retry.
+    assert provider.calls == 1
+
+
+def test_concurrent_canary_requests_make_at_most_one_provider_call(client, monkeypatch):
+    import app
+    configure_mock(app, monkeypatch)
+    _, campaign = launch(client, "concurrent@example.com", datetime.now(timezone.utc) - timedelta(minutes=1))
+    assert authorize(client, campaign["id"]).status_code == 200
+
+    class HoldingProvider:
+        name = "mock"
+        calls = 0
+        entered = threading.Event()
+        release = threading.Event()
+        def send(self, **kwargs):
+            self.calls += 1
+            self.entered.set()
+            assert self.release.wait(5)
+            from email_providers import EmailSendResult
+            return EmailSendResult("concurrent-one")
+
+    provider = HoldingProvider()
+    monkeypatch.setattr(app, "configured_provider", lambda *args: provider)
+    first_result = []
+    thread = threading.Thread(target=lambda: first_result.append(execute_canary(client, campaign)))
+    thread.start()
+    assert provider.entered.wait(5)
+    second = execute_canary(client, campaign)
+    provider.release.set()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert provider.calls == 1
+    assert first_result[0].status_code == 200
+    assert second.status_code == 409
 
 
 def test_campaign_defaults_safe_and_authorization_validates_confirmation_and_actor(client):

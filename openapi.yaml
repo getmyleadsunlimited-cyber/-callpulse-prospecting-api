@@ -109,6 +109,42 @@ paths:
       responses:
         '200': {description: Read-only campaign safety state}
         '404': {description: Campaign not found}
+  /campaigns/{campaign_id}/canary-execute:
+    post:
+      operationId: executeOneCanaryDelivery
+      summary: Explicitly attempt at most one persisted email delivery.
+      parameters: [{$ref: '#/components/parameters/campaignId'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [authorized_by, confirmation, delivery_id]
+              properties:
+                authorized_by: {type: string}
+                confirmation: {type: string, const: 'EXECUTE ONE CANARY DELIVERY'}
+                delivery_id: {type: integer}
+      responses:
+        '200': {description: Confirmed send or idempotent already-executed result}
+        '409': {description: Structured fail-closed safety failures; provider was not called}
+        '503': {description: Email provider is disabled or incompletely configured}
+  /deliveries/{delivery_id}/execution:
+    get:
+      operationId: inspectDeliveryExecution
+      summary: Read non-secret persisted canary execution state; never execute.
+      parameters: [{$ref: '#/components/parameters/deliveryId'}]
+      responses:
+        '200': {description: Persisted execution state}
+        '404': {description: Delivery not found}
+  /deliveries/{delivery_id}/canary-preflight:
+    get:
+      operationId: preflightCanaryDelivery
+      summary: Evaluate current canary eligibility without changing state.
+      parameters: [{$ref: '#/components/parameters/deliveryId'}]
+      responses:
+        '200': {description: Structured eligibility decision and all failures}
+        '404': {description: Delivery not found}
   /launcher/run:
     post:
       operationId: runDueCampaignTouches
@@ -160,6 +196,7 @@ components:
   parameters:
     prospectId: {in: path, name: prospect_id, required: true, schema: {type: integer}}
     campaignId: {in: path, name: campaign_id, required: true, schema: {type: integer}}
+    deliveryId: {in: path, name: delivery_id, required: true, schema: {type: integer}}
   schemas:
     CampaignSequenceState:
       type: object
