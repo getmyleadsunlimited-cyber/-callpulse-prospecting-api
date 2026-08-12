@@ -28,6 +28,13 @@ paths:
       operationId: listIndustryButtons
       summary: Return selectable business verticals and industry opening-message helpers.
       responses: {'200': {description: Industry buttons}}
+  /email-provider/status:
+    get:
+      operationId: inspectEmailProviderStatus
+      summary: Inspect non-secret email provider readiness without sending.
+      responses:
+        '200': {description: Provider mode, readiness, approved sender, and disabled automatic live-send state}
+        '401': {description: Unauthorized}
   /prospects:
     get:
       operationId: listProspects

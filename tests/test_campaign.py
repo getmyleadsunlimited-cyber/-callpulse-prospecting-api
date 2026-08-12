@@ -3,6 +3,7 @@ import json
 import re
 import subprocess
 import threading
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -60,6 +61,7 @@ def test_openapi_uses_http_bearer_security_for_protected_endpoints(client):
 
     protected_operations = {
         ("/industries", "get"),
+        ("/email-provider/status", "get"),
         ("/prospects", "get"),
         ("/prospects", "post"),
         ("/prospects/{prospect_id}/campaigns", "post"),
@@ -557,3 +559,96 @@ def test_safety_inspection_is_read_only(client):
     with app.engine.connect() as connection:
         after = connection.exec_driver_sql("SELECT * FROM campaign_touches ORDER BY id").mappings().all()
     assert before == after
+
+
+def test_provider_status_and_preflight_expose_only_non_secret_readiness(client, monkeypatch, caplog):
+    import app
+    monkeypatch.setattr(app, "EMAIL_PROVIDER_NAME", "microsoft_graph")
+    monkeypatch.setattr(app, "EMAIL_FROM", "approved@example.com")
+    monkeypatch.setattr(app, "MICROSOFT_TENANT_ID", "tenant-secret-value")
+    monkeypatch.setattr(app, "MICROSOFT_CLIENT_ID", "client-secret-value")
+    monkeypatch.setattr(app, "MICROSOFT_CLIENT_SECRET", "credential-secret-value")
+    _, campaign = launch(client, "provider-status@example.com")
+    response = client.get("/email-provider/status", headers=headers())
+    assert response.status_code == 200
+    assert response.json() == {"provider": "microsoft_graph", "configured": True,
+                               "sender": "approved@example.com", "live_send_enabled": False}
+    preflight = client.get(
+        f"/deliveries/{campaign['touches'][0]['id']}/canary-preflight", headers=headers()).json()
+    assert preflight["provider"] == "microsoft_graph"
+    assert preflight["provider_configured"] is True
+    combined = response.text + json.dumps(preflight) + caplog.text
+    assert all(secret not in combined for secret in
+               ("tenant-secret-value", "client-secret-value", "credential-secret-value"))
+
+
+@pytest.mark.parametrize("missing, reason", [
+    ("MICROSOFT_TENANT_ID", "microsoft tenant id is not configured"),
+    ("MICROSOFT_CLIENT_ID", "microsoft client id is not configured"),
+    ("MICROSOFT_CLIENT_SECRET", "microsoft client secret is not configured"),
+])
+def test_graph_missing_configuration_is_reported(client, monkeypatch, missing, reason):
+    import app
+    monkeypatch.setattr(app, "EMAIL_PROVIDER_NAME", "microsoft_graph")
+    monkeypatch.setattr(app, "EMAIL_FROM", "approved@example.com")
+    monkeypatch.setattr(app, "MICROSOFT_TENANT_ID", "tenant")
+    monkeypatch.setattr(app, "MICROSOFT_CLIENT_ID", "client")
+    monkeypatch.setattr(app, "MICROSOFT_CLIENT_SECRET", "secret")
+    monkeypatch.setattr(app, missing, "")
+    _, campaign = launch(client, f"{missing.lower()}@example.com")
+    result = client.get(
+        f"/deliveries/{campaign['touches'][0]['id']}/canary-preflight", headers=headers()).json()
+    assert result["provider_configured"] is False and reason in result["failures"]
+
+
+def test_microsoft_graph_uses_client_credentials_and_sendmail_without_message_id(monkeypatch):
+    import email_providers
+    email_providers.MicrosoftGraphEmailProvider._token_cache.clear()
+    requests = []
+
+    class Response:
+        def __init__(self, status, body=b"", headers=None):
+            self.status, self._body, self.headers = status, body, headers or {}
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self): return self._body
+
+    def fake_urlopen(request, timeout):
+        requests.append(request)
+        if "login.microsoftonline.com" in request.full_url:
+            return Response(200, b'{"access_token":"never-log-this-token","expires_in":3600}')
+        return Response(202, headers={"request-id": "safe-correlation"})
+
+    monkeypatch.setattr(email_providers.urllib.request, "urlopen", fake_urlopen)
+    provider = email_providers.MicrosoftGraphEmailProvider("tenant", "client", "secret")
+    result = provider.send(sender="approved@example.com", recipient="recipient@example.com",
+                           subject="Persisted subject", message="Persisted body",
+                           idempotency_key="stable-key")
+    assert len(requests) == 2
+    token_body = requests[0].data.decode()
+    assert "scope=https%3A%2F%2Fgraph.microsoft.com%2F.default" in token_body
+    assert "grant_type=client_credentials" in token_body
+    send_body = json.loads(requests[1].data)
+    assert send_body["message"]["subject"] == "Persisted subject"
+    assert send_body["message"]["body"]["content"] == "Persisted body"
+    assert requests[1].full_url.endswith("/users/approved%40example.com/sendMail")
+    assert result.message_id is None and result.correlation_id == "safe-correlation"
+
+
+def test_microsoft_graph_auth_and_rate_limit_fail_safely_without_retry(monkeypatch):
+    import email_providers
+    email_providers.MicrosoftGraphEmailProvider._token_cache.clear()
+    calls = 0
+
+    def auth_failure(request, timeout):
+        nonlocal calls
+        calls += 1
+        raise urllib.error.HTTPError(request.full_url, 401, "secret response", {}, None)
+
+    monkeypatch.setattr(email_providers.urllib.request, "urlopen", auth_failure)
+    provider = email_providers.MicrosoftGraphEmailProvider("tenant", "client", "secret")
+    with pytest.raises(email_providers.EmailProviderError,
+                       match="microsoft graph authentication failed"):
+        provider.send(sender="approved@example.com", recipient="recipient@example.com",
+                      subject="subject", message="body", idempotency_key="key")
+    assert calls == 1
