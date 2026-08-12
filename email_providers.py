@@ -98,6 +98,8 @@ class MicrosoftGraphEmailProvider:
             payload = json.loads(exc.read())
         except (AttributeError, ValueError, TypeError, OSError):
             payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
         error_name = payload.get("error")
         if isinstance(error_name, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", error_name):
             detail += f", {error_name}"
@@ -137,6 +139,8 @@ class MicrosoftGraphEmailProvider:
                 raise EmailProviderError("microsoft graph authentication failed") from exc
             except (urllib.error.URLError, TimeoutError) as exc:
                 raise EmailProviderError("microsoft graph authentication network failure") from exc
+            if not isinstance(payload, dict):
+                raise EmailProviderError("microsoft graph authentication failed")
             token = payload.get("access_token")
             if not token:
                 raise EmailProviderError("microsoft graph authentication failed")
