@@ -65,7 +65,25 @@ CALLPULSE_EMAIL_PROVIDER=disabled
 CALLPULSE_EMAIL_FROM=
 ```
 
-The existing HTTPS operator webhook adapter now implements the explicit `EmailDeliveryProvider` boundary. Legitimate use requires `CALLPULSE_EMAIL_PROVIDER=webhook`, an approved `CALLPULSE_EMAIL_FROM`, and an HTTPS `CALLPULSE_DELIVERY_WEBHOOK`. The deterministic `mock` provider is test-only and performs no network I/O. No Outlook/Microsoft Graph adapter or credentials exist in this repository. A future Graph adapter would require an approved sender plus legitimately provisioned tenant ID, client ID, and client credential/token configuration; these are not currently consumed, and Outlook is not assumed connected.
+The deterministic `mock` provider is test-only and performs no network I/O.
+
+## Microsoft Graph Email Provider
+
+Email delivery defaults to disabled and must be explicitly configured through environment variables only:
+
+```text
+CALLPULSE_EMAIL_PROVIDER=microsoft_graph
+CALLPULSE_EMAIL_FROM=approved-sender@example.com
+MICROSOFT_TENANT_ID=<Microsoft Entra tenant ID>
+MICROSOFT_CLIENT_ID=<application client ID>
+MICROSOFT_CLIENT_SECRET=<application client secret>
+```
+
+`CALLPULSE_EMAIL_FROM` is the sole approved sender; callers cannot override it. The provider obtains an in-memory, short-lived OAuth 2.0 client-credentials token from the Microsoft identity platform with the `https://graph.microsoft.com/.default` scope, then calls `POST /v1.0/users/{approved-sender}/sendMail` with the exact persisted delivery subject and message. Tokens and credentials are never persisted or returned. Graph `sendMail` normally returns `202 Accepted` without a message resource, so the API records a safe Graph request correlation ID rather than falsely claiming a message ID.
+
+The Entra application requires administrator-consented Microsoft Graph **Mail.Send application permission**, and the approved sender must be a valid mailbox the application is permitted to use. Tenant administrators should restrict application mailbox access according to their Microsoft 365 policy. Authentication, permission, sender, throttling, service, timeout, and network failures fail closed and are not automatically retried.
+
+Authenticated `GET /email-provider/status` reports only provider mode, readiness, approved sender, and `live_send_enabled: false`; it performs no network request. Canary preflight includes the same non-secret readiness information. Canary execution still requires explicit live authorization and all existing safety gates. One canary request can attempt at most one external email. Automatic campaign sending, background workers, bulk sending, and automatic retries are not enabled.
 
 ## Development
 

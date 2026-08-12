@@ -17,7 +17,7 @@ from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, Uni
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
-from email_providers import configured_provider
+from email_providers import EmailProviderError, configured_provider
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:////tmp/callpulse.db")
 if DATABASE_URL.startswith("postgres://"):
@@ -29,6 +29,9 @@ DRY_RUN = os.getenv("CALLPULSE_DRY_RUN", "true").lower() != "false"
 DELIVERY_WEBHOOK = os.getenv("CALLPULSE_DELIVERY_WEBHOOK", "")
 EMAIL_PROVIDER_NAME = os.getenv("CALLPULSE_EMAIL_PROVIDER", "disabled").strip().lower()
 EMAIL_FROM = os.getenv("CALLPULSE_EMAIL_FROM", "").strip()
+MICROSOFT_TENANT_ID = os.getenv("MICROSOFT_TENANT_ID", "").strip()
+MICROSOFT_CLIENT_ID = os.getenv("MICROSOFT_CLIENT_ID", "").strip()
+MICROSOFT_CLIENT_SECRET = os.getenv("MICROSOFT_CLIENT_SECRET", "")
 TOUCH_DAYS = (0, 3, 6)
 GENERAL_INDUSTRIES = (
     "eCommerce", "Roofing", "HVAC", "Dental", "Garage Door Repair", "Plumbing",
@@ -114,6 +117,7 @@ class Touch(Base):
     scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     status: Mapped[str] = mapped_column(String(30), default="scheduled", index=True)
     message: Mapped[str] = mapped_column(Text)
+    subject: Mapped[str] = mapped_column(String(300), default="A practical lead recovery idea")
     idempotency_key: Mapped[str] = mapped_column(String(64), unique=True)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     dry_run: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -125,6 +129,7 @@ class Touch(Base):
     execution_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     provider_name: Mapped[str | None] = mapped_column(String(40))
     provider_message_id: Mapped[str | None] = mapped_column(String(300))
+    provider_correlation_id: Mapped[str | None] = mapped_column(String(300))
     last_execution_error: Mapped[str | None] = mapped_column(String(500))
     execution_attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     campaign: Mapped[Campaign] = relationship(back_populates="touches")
@@ -151,6 +156,7 @@ class CanaryExecutionAudit(Base):
     idempotency_key: Mapped[str] = mapped_column(String(64), index=True)
     provider_name: Mapped[str] = mapped_column(String(40))
     provider_message_id: Mapped[str | None] = mapped_column(String(300))
+    provider_correlation_id: Mapped[str | None] = mapped_column(String(300))
     result: Mapped[str] = mapped_column(String(30))
     failure_reason: Mapped[str | None] = mapped_column(String(1000))
 
@@ -190,7 +196,8 @@ def normalize_email(email: str) -> str:
 # execution does not use this function; it always goes through EmailDeliveryProvider.
 def deliver(email: str, message: str, idempotency_key: str) -> None:
     configured_provider("webhook", DELIVERY_WEBHOOK).send(
-        sender=EMAIL_FROM, recipient=email, message=message, idempotency_key=idempotency_key)
+        sender=EMAIL_FROM, recipient=email, subject="CallPulse outreach",
+        message=message, idempotency_key=idempotency_key)
 
 
 class ProspectIn(BaseModel):
@@ -239,6 +246,9 @@ class CanaryExecutionIn(BaseModel):
 class DeliveryEligibility(BaseModel):
     eligible: bool
     failures: list[str]
+    provider: str | None = None
+    provider_configured: bool = False
+    sender: str | None = None
 
 
 class SuppressionIn(BaseModel):
@@ -391,13 +401,32 @@ def can_execute_delivery(touch: Touch, campaign: Campaign, prospect: Prospect,
     )) is not None:
         failures.append("another execution is already in flight")
     if check_provider:
-        if not EMAIL_FROM: failures.append("approved sender identity is not configured")
+        failures.extend(provider_readiness_failures())
     failures = list(dict.fromkeys(failures))
-    return DeliveryEligibility(eligible=not failures, failures=failures)
+    return DeliveryEligibility(eligible=not failures, failures=failures,
+                               provider=EMAIL_PROVIDER_NAME,
+                               provider_configured=not provider_readiness_failures(),
+                               sender=EMAIL_FROM or None)
+
+
+def provider_readiness_failures() -> list[str]:
+    failures: list[str] = []
+    if not EMAIL_FROM:
+        failures.append("approved sender identity is not configured")
+    if EMAIL_PROVIDER_NAME == "disabled":
+        failures.append("email delivery provider is disabled")
+    elif EMAIL_PROVIDER_NAME == "microsoft_graph":
+        if not MICROSOFT_TENANT_ID: failures.append("microsoft tenant id is not configured")
+        if not MICROSOFT_CLIENT_ID: failures.append("microsoft client id is not configured")
+        if not MICROSOFT_CLIENT_SECRET: failures.append("microsoft client secret is not configured")
+    elif EMAIL_PROVIDER_NAME != "mock":
+        failures.append("email delivery provider is unsupported")
+    return failures
 
 
 def add_canary_audit(db: Session, touch: Touch, authorized_by: str, result: str,
-                     failure: str | None = None, provider_message_id: str | None = None) -> None:
+                     failure: str | None = None, provider_message_id: str | None = None,
+                     provider_correlation_id: str | None = None) -> None:
     campaign, prospect = touch.campaign, touch.campaign.prospect
     db.add(CanaryExecutionAudit(
         campaign_id=campaign.id, delivery_id=touch.id, prospect_id=prospect.id,
@@ -405,6 +434,7 @@ def add_canary_audit(db: Session, touch: Touch, authorized_by: str, result: str,
         execution_requested_at=utcnow(), sender_identity=EMAIL_FROM,
         recipient_email=prospect.verified_email or "", idempotency_key=touch.idempotency_key or "",
         provider_name=EMAIL_PROVIDER_NAME, provider_message_id=provider_message_id,
+        provider_correlation_id=provider_correlation_id,
         result=result, failure_reason=failure,
     ))
 
@@ -413,6 +443,13 @@ def add_canary_audit(db: Session, touch: Touch, authorized_by: str, result: str,
 def health(db: Session = Depends(db_session)):
     db.execute(select(1))
     return {"ok": True, "database": "connected", "dry_run": DRY_RUN}
+
+
+@app.get("/email-provider/status", dependencies=[Depends(require_auth)],
+         summary="Inspect email provider readiness without sending.")
+def email_provider_status():
+    return {"provider": EMAIL_PROVIDER_NAME, "configured": not provider_readiness_failures(),
+            "sender": EMAIL_FROM or None, "live_send_enabled": False}
 
 
 @app.get(
@@ -682,6 +719,7 @@ def inspect_delivery_execution(delivery_id: int, db: Session = Depends(db_sessio
         "prospect_id": prospect.id, "execution_status": touch.execution_status,
         "attempt_count": touch.execution_attempt_count, "sent_at": touch.sent_at,
         "provider": touch.provider_name, "provider_message_id": touch.provider_message_id,
+        "provider_correlation_id": touch.provider_correlation_id,
         "idempotency_key": touch.idempotency_key, "sender": EMAIL_FROM or None,
         "recipient": prospect.verified_email, "last_execution_error": touch.last_execution_error,
     }
@@ -723,12 +761,17 @@ def canary_execute(campaign_id: int, body: CanaryExecutionIn, db: Session = Depe
             "detail": "Canary execution blocked by safety checks", "failures": eligibility.failures,
         })
 
-    if EMAIL_PROVIDER_NAME not in {"mock", "webhook"}:
+    if provider_readiness_failures():
         add_canary_audit(db, touch, body.authorized_by, "failed", "email delivery provider is not configured")
         db.commit()
         raise HTTPException(503, "No email delivery provider is configured; no email was sent")
     try:
-        provider = configured_provider(EMAIL_PROVIDER_NAME, DELIVERY_WEBHOOK)
+        if EMAIL_PROVIDER_NAME == "microsoft_graph":
+            provider = configured_provider(EMAIL_PROVIDER_NAME, tenant_id=MICROSOFT_TENANT_ID,
+                                           client_id=MICROSOFT_CLIENT_ID,
+                                           client_secret=MICROSOFT_CLIENT_SECRET)
+        else:
+            provider = configured_provider(EMAIL_PROVIDER_NAME, DELIVERY_WEBHOOK)
     except ValueError as exc:
         add_canary_audit(db, touch, body.authorized_by, "failed", str(exc))
         db.commit()
@@ -778,23 +821,29 @@ def canary_execute(campaign_id: int, body: CanaryExecutionIn, db: Session = Depe
     try:
         result = provider.send(
             sender=EMAIL_FROM, recipient=touch.campaign.prospect.verified_email,
-            message=touch.message, idempotency_key=touch.idempotency_key,
+            subject=touch.subject, message=touch.message, idempotency_key=touch.idempotency_key,
         )
     except Exception as exc:
-        safe_error = f"{type(exc).__name__}: email provider call failed"[:500]
+        safe_error = (exc.reason if isinstance(exc, EmailProviderError)
+                      else f"{type(exc).__name__}: email provider call failed")[:500]
         touch.execution_status = "failed"
         touch.execution_completed_at = utcnow()
         touch.last_execution_error = safe_error
         add_canary_audit(db, touch, body.authorized_by, "failed", safe_error)
         db.commit()
-        raise HTTPException(502, "Email provider call failed; no send was confirmed")
+        content = {"detail": "Email provider call failed; no send was confirmed"}
+        if isinstance(exc, EmailProviderError) and exc.retry_after:
+            content["retry_after"] = exc.retry_after
+        return JSONResponse(status_code=502, content=content)
 
     completed = utcnow()
     touch.status, touch.sent_at, touch.execution_status = "sent", completed, "sent"
     touch.execution_completed_at = completed
     touch.provider_message_id = result.message_id
+    touch.provider_correlation_id = result.correlation_id
     touch.last_execution_error = None
-    add_canary_audit(db, touch, body.authorized_by, "sent", provider_message_id=result.message_id)
+    add_canary_audit(db, touch, body.authorized_by, "sent", provider_message_id=result.message_id,
+                     provider_correlation_id=result.correlation_id)
     db.commit()
     return {"delivery_id": touch.id, "execution_status": "sent", "already_executed": False,
             "sent_at": touch.sent_at, "provider": provider.name,
@@ -826,7 +875,9 @@ def launch_campaign(prospect_id: int, body: CampaignIn, db: Session = Depends(db
     }
     for day in TOUCH_DAYS:
         key = hashlib.sha256(f"{body.idempotency_key}:{p.id}:{day}".encode()).hexdigest()
-        campaign.touches.append(Touch(day=day, scheduled_at=start + timedelta(days=day), message=templates[day], idempotency_key=key))
+        campaign.touches.append(Touch(day=day, scheduled_at=start + timedelta(days=day),
+                                      subject=f"Lead recovery for {p.company_name}",
+                                      message=templates[day], idempotency_key=key))
     p.status, p.updated_at = "campaign_active", utcnow()
     db.add(campaign)
     db.commit()
