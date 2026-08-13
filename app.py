@@ -15,7 +15,9 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select, update
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, case, create_engine, select, update
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
@@ -258,6 +260,28 @@ class LoginSecurityEvent(Base):
     succeeded: Mapped[bool] = mapped_column(Boolean, default=False)
     reason: Mapped[str] = mapped_column(String(40))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+
+
+class LoginRateLimit(Base):
+    __tablename__ = "login_rate_limits"
+    key: Mapped[str] = mapped_column(String(65), primary_key=True)
+    window_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer)
+
+
+class PendingInvitation(Base):
+    __tablename__ = "pending_invitations"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), index=True)
+    email: Mapped[str] = mapped_column(String(320), index=True)
+    role: Mapped[str] = mapped_column(String(20))
+    primary_workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"))
+    workspace_ids_json: Mapped[str] = mapped_column(Text)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_by_user_id: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 class WorkspaceAudit(Base):
@@ -534,7 +558,6 @@ class LoginIn(BaseModel):
 
 class UserCreateIn(BaseModel):
     email: str = Field(max_length=320)
-    password: str = Field(min_length=12, max_length=PASSWORD_MAX_LENGTH)
     role: Literal["owner", "admin", "member", "viewer"]
     account_id: str | None = None
     account_type: Literal["direct", "agency", "client"] | None = None
@@ -558,6 +581,11 @@ class PasswordChangeIn(BaseModel):
 class AgencyWorkspaceIn(BaseModel):
     agency_account_id: str
     workspace_id: str
+
+
+class InvitationAcceptIn(BaseModel):
+    token: str = Field(min_length=20, max_length=200)
+    password: str | None = Field(default=None, min_length=12, max_length=PASSWORD_MAX_LENGTH)
 
 
 class CampaignSequenceState(BaseModel):
@@ -764,6 +792,31 @@ def record_login_event(db: Session, email: str, account_id: str, source: str,
                               source_key=login_key(source), succeeded=succeeded, reason=reason))
 
 
+def reserve_login_attempt(db: Session, key: str, limit: int, now: datetime) -> bool:
+    """Atomically reserve one attempt in a fixed window before password hashing."""
+    cutoff = now - timedelta(minutes=LOGIN_WINDOW_MINUTES)
+    dialect_insert = postgresql_insert if db.bind.dialect.name == "postgresql" else sqlite_insert
+    incoming = {"key": key, "window_started_at": now, "attempts": 1}
+    statement = dialect_insert(LoginRateLimit).values(**incoming)
+    statement = statement.on_conflict_do_update(
+        index_elements=[LoginRateLimit.key],
+        set_={
+            "window_started_at": case(
+                (LoginRateLimit.window_started_at <= cutoff, now),
+                else_=LoginRateLimit.window_started_at,
+            ),
+            "attempts": case(
+                (LoginRateLimit.window_started_at <= cutoff, 1),
+                else_=LoginRateLimit.attempts + 1,
+            ),
+        },
+        where=((LoginRateLimit.window_started_at <= cutoff) | (LoginRateLimit.attempts < limit)),
+    ).returning(LoginRateLimit.attempts)
+    reserved = db.scalar(statement) is not None
+    db.commit()  # Publish the reservation before expensive PBKDF2 work begins.
+    return reserved
+
+
 @app.post("/auth/login")
 def login(body: LoginIn, request: Request, db: Session = Depends(db_session)):
     source = request.client.host if request.client else "unknown"
@@ -772,16 +825,10 @@ def login(body: LoginIn, request: Request, db: Session = Depends(db_session)):
     except ValueError:
         email = body.email.strip().lower()[:320]
     account_key, source_key = login_key(f"{email}:{body.account_id}"), login_key(source)
-    cutoff = utcnow() - timedelta(minutes=LOGIN_WINDOW_MINUTES)
-    account_throttled = db.scalar(select(LoginSecurityEvent.id).where(
-        LoginSecurityEvent.created_at >= cutoff, LoginSecurityEvent.succeeded.is_(False),
-        LoginSecurityEvent.account_key == account_key,
-    ).order_by(LoginSecurityEvent.id.desc()).offset(LOGIN_MAX_FAILURES - 1))
-    source_throttled = db.scalar(select(LoginSecurityEvent.id).where(
-        LoginSecurityEvent.created_at >= cutoff, LoginSecurityEvent.succeeded.is_(False),
-        LoginSecurityEvent.source_key == source_key,
-    ).order_by(LoginSecurityEvent.id.desc()).offset(LOGIN_SOURCE_MAX_FAILURES - 1))
-    if account_throttled is not None or source_throttled is not None:
+    now = utcnow()
+    account_reserved = reserve_login_attempt(db, f"a:{account_key}", LOGIN_MAX_FAILURES, now)
+    source_reserved = reserve_login_attempt(db, f"s:{source_key}", LOGIN_SOURCE_MAX_FAILURES, now)
+    if not account_reserved or not source_reserved:
         record_login_event(db, email, body.account_id, source, False, "throttled")
         db.commit()
         raise HTTPException(429, "Too many login attempts; try again later")
@@ -873,6 +920,11 @@ def validate_membership_workspaces(db: Session, account: Account, primary: str,
     return workspaces
 
 
+def deliver_invitation_token(email: str, token: str) -> None:
+    """Provider seam: production deployments deliver this out-of-band to the invitee."""
+    raise HTTPException(503, "Invitation delivery provider is not configured")
+
+
 @app.post("/users", status_code=201, dependencies=[Depends(require_roles("owner"))])
 def create_user(body: UserCreateIn, identity: AuthenticatedIdentity = Depends(require_auth),
                 db: Session = Depends(db_session)):
@@ -885,7 +937,6 @@ def create_user(body: UserCreateIn, identity: AuthenticatedIdentity = Depends(re
     try:
         email, primary = normalize_email(body.email), validate_workspace_id(primary)
         requested = {validate_workspace_id(x) for x in body.workspace_ids}
-        encoded = hash_password(body.password)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
     account = db.get(Account, account_id)
@@ -908,21 +959,67 @@ def create_user(body: UserCreateIn, identity: AuthenticatedIdentity = Depends(re
         db.add(workspace)
         db.flush()
     workspaces = validate_membership_workspaces(db, account, primary, requested)
-    user = db.scalar(select(User).where(User.email == email))
-    if not user:
-        user = User(email=email, password_hash=encoded)
-        db.add(user)
-        db.flush()
+    token = secrets.token_urlsafe(32)
+    invitation = PendingInvitation(
+        account_id=account.id, email=email, role=body.role, primary_workspace_id=primary,
+        workspace_ids_json=json.dumps(sorted(workspaces)),
+        token_hash=hashlib.sha256(token.encode()).hexdigest(),
+        expires_at=utcnow() + timedelta(hours=24), created_by_user_id=identity.user_id,
+    )
+    db.add(invitation)
+    db.add(UserAudit(account_id=account.id, actor_user_id=identity.user_id, target_user_id=0,
+                     action="invitation_created", details=json.dumps({"role": body.role}, sort_keys=True)))
+    deliver_invitation_token(email, token)
+    db.commit()
+    return {"status": "pending", "expires_in": 86400}
+
+
+def optional_identity(credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme)) -> AuthenticatedIdentity | None:
+    if credentials is None:
+        return None
+    return require_auth(credentials)
+
+
+@app.post("/invitations/accept", status_code=201)
+def accept_invitation(body: InvitationAcceptIn, identity: AuthenticatedIdentity | None = Depends(optional_identity),
+                      db: Session = Depends(db_session)):
+    token_hash = hashlib.sha256(body.token.encode()).hexdigest()
+    invitation = db.scalar(select(PendingInvitation).where(
+        PendingInvitation.token_hash == token_hash).with_for_update())
+    expires = invitation.expires_at.replace(tzinfo=timezone.utc) if invitation and invitation.expires_at.tzinfo is None else (invitation.expires_at if invitation else utcnow())
+    if not invitation or invitation.accepted_at is not None or expires <= utcnow():
+        raise HTTPException(410, "Invitation is invalid or expired")
+    user = db.scalar(select(User).where(User.email == invitation.email))
+    if user:
+        if not identity or identity.user_id != user.id:
+            raise HTTPException(401, "Authenticate as the invited identity to accept this invitation")
+    else:
+        if identity is not None:
+            raise HTTPException(403, "Invitation does not belong to the authenticated identity")
+        if body.password is None:
+            raise HTTPException(422, "A password is required to establish a new identity")
+        user = User(email=invitation.email, password_hash=hash_password(body.password))
+        db.add(user); db.flush()
     existing = db.scalar(select(AccountMembership).where(
-        AccountMembership.user_id == user.id, AccountMembership.account_id == account.id))
+        AccountMembership.user_id == user.id, AccountMembership.account_id == invitation.account_id))
     if existing:
-        # Same response for a local duplicate and an identity already used elsewhere.
-        raise HTTPException(409, "An account membership for this invitation already exists")
-    membership = AccountMembership(user_id=user.id, account_id=account.id,
-                                   primary_workspace_id=primary, role=body.role)
-    membership.workspace_grants = [MembershipWorkspaceAccess(workspace_id=x) for x in sorted(workspaces)]
+        raise HTTPException(409, "An account membership already exists")
+    db.scalar(select(Account).where(Account.id == invitation.account_id).with_for_update())
+    has_active_membership = db.scalar(select(AccountMembership.id).where(
+        AccountMembership.account_id == invitation.account_id,
+        AccountMembership.active.is_(True)).limit(1)) is not None
+    if not has_active_membership and invitation.role != "owner":
+        raise HTTPException(409, "The first active account membership must be an owner")
+    membership = AccountMembership(
+        user_id=user.id, account_id=invitation.account_id,
+        primary_workspace_id=invitation.primary_workspace_id, role=invitation.role,
+    )
+    membership.workspace_grants = [MembershipWorkspaceAccess(workspace_id=x)
+                                   for x in json.loads(invitation.workspace_ids_json)]
     db.add(membership); db.flush()
-    audit_membership(db, identity, membership, "user_created", {"role": body.role, "workspace_ids": sorted(workspaces)})
+    invitation.accepted_at = utcnow()
+    audit_membership(db, identity or AuthenticatedIdentity("direct", invitation.primary_workspace_id),
+                     membership, "invitation_accepted", {"role": membership.role})
     db.commit()
     return membership_dict(membership)
 
