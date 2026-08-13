@@ -10,6 +10,92 @@ servers:
   - url: https://callpulse-prospecting-api.onrender.com
 security: [{bearerAuth: []}]
 paths:
+  /auth/login:
+    post:
+      security: []
+      operationId: loginCustomerUser
+      summary: Exchange a customer email and password for an opaque bearer token.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/Login'}}}
+      responses: {'200': {description: Expiring bearer token}, '401': {description: Invalid credentials}, '429': {description: Login throttled}}
+  /auth/logout:
+    post:
+      operationId: logout
+      summary: Revoke the current bearer session.
+      responses: {'204': {description: Session revoked}}
+  /auth/revoke-all:
+    post:
+      operationId: revokeAllSessions
+      summary: Revoke every session belonging to the authenticated identity.
+      responses: {'204': {description: Sessions revoked}}
+  /auth/revoke-account:
+    post:
+      operationId: revokeAccountSessions
+      summary: Owner-only revocation of every session for every membership in the current account.
+      responses: {'204': {description: Account sessions revoked and audited}}
+  /auth/change-password:
+    post:
+      operationId: changePassword
+      summary: Change the identity password and revoke all existing sessions.
+      responses: {'204': {description: Password changed and sessions revoked}}
+  /me:
+    get:
+      operationId: currentUser
+      summary: Return the authenticated user's account, role, and authorized workspace set.
+      responses: {'200': {description: Current user identity}, '401': {description: Unauthorized}}
+  /users:
+    get:
+      operationId: listUsers
+      summary: List users in the owner's account.
+      responses: {'200': {description: Account users}, '403': {description: Owner role required}}
+    post:
+      operationId: inviteUser
+      summary: Create an account-local pending invitation; credentials are established only by the invitee.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/UserCreate'}}}
+      responses: {'201': {description: Generic pending-invitation acknowledgement}, '403': {description: Owner role required}, '503': {description: Invitation delivery unavailable; transaction rolled back}}
+  /invitations/accept:
+    post:
+      security: []
+      operationId: acceptInvitation
+      summary: Accept a single-use invitation; existing identities authenticate and new identities set a password.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/InvitationAccept'}}}
+      responses: {'201': {description: Account membership created}, '410': {description: Invitation invalid, used, or expired}}
+  /users/{membership_id}/role:
+    patch:
+      operationId: changeUserRole
+      parameters: [{in: path, name: membership_id, required: true, schema: {type: integer}}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object, required: [role], properties: {role: {$ref: '#/components/schemas/UserRole'}}}}}
+      responses: {'200': {description: Role changed and audited}, '404': {description: User not found in account}}
+  /users/{membership_id}/deactivate:
+    post:
+      operationId: deactivateUser
+      parameters: [{in: path, name: membership_id, required: true, schema: {type: integer}}]
+      responses: {'200': {description: User deactivated, sessions revoked, and action audited}}
+  /users/{membership_id}/workspace-access:
+    put:
+      operationId: changeUserWorkspaceAccess
+      parameters: [{in: path, name: membership_id, required: true, schema: {type: integer}}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object, required: [workspace_ids], properties: {workspace_ids: {type: array, items: {type: string}}}}}}
+      responses: {'200': {description: Workspace grants replaced and audited}, '403': {description: Grant exceeds owner's access}}
+  /users/{membership_id}/revoke-sessions:
+    post:
+      operationId: revokeMembershipSessions
+      parameters: [{in: path, name: membership_id, required: true, schema: {type: integer}}]
+      responses: {'204': {description: Membership sessions revoked and audited}}
+  /internal/agency-workspaces:
+    post:
+      operationId: delegateAgencyWorkspace
+      summary: Internal-admin provisioning of an authoritative agency-to-client-workspace relationship.
+      responses: {'201': {description: Relationship created}, '403': {description: Internal administrator required}}
   /health:
     get:
       security: []
@@ -54,6 +140,16 @@ paths:
         required: true
         content: {application/json: {schema: {$ref: '#/components/schemas/Prospect'}}}
       responses: {'201': {description: Created}, '409': {description: Duplicate email}, '422': {description: Unverified or invalid}}
+  /prospects/{prospect_id}/approve:
+    post:
+      operationId: approveProspect
+      summary: Approve a researched prospect in the selected authorized workspace.
+      description: Idempotently changes a researched prospect to approved without verifying its email or initiating outreach.
+      parameters: [{$ref: '#/components/parameters/prospectId'}, {$ref: '#/components/parameters/workspaceId'}]
+      responses:
+        '200': {description: Prospect approved, or the current prospect state returned unchanged on a retry}
+        '403': {description: The authenticated role or selected workspace is not authorized}
+        '404': {description: Prospect not found in the selected workspace}
   /prospects/{prospect_id}/campaigns:
     get:
       operationId: inspectProspectCampaigns
@@ -81,6 +177,24 @@ paths:
                 idempotency_key: {type: string, minLength: 8, maxLength: 100}
                 start_at: {type: [string, 'null'], format: date-time}
       responses: {'201': {description: Idempotent campaign with Day 0/3/6 touches}, '409': {description: Suppressed}}
+  /internal/prospects/{prospect_id}/verify-email:
+    post:
+      operationId: verifyProspectEmailInternal
+      summary: Internal-admin-only transition that verifies an exact normalized email and invalidates prior recipient authorization on change.
+      parameters: [{$ref: '#/components/parameters/prospectId'}, {$ref: '#/components/parameters/workspaceId'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [verified_email]
+              properties: {verified_email: {type: string, format: email}}
+      responses:
+        '200': {description: Prospect email normalized and marked verified; changed recipients invalidate campaign authorization and unsent delivery eligibility}
+        '409': {description: The normalized verified email is already assigned to another prospect in the selected workspace}
+        '403': {description: Internal administrator authentication required}
+        '404': {description: Prospect not found in the selected workspace}
   /campaigns/{campaign_id}/deliveries:
     get:
       operationId: inspectCampaignDeliveries
@@ -228,6 +342,29 @@ components:
       description: Selects only a workspace already granted to the bearer credential; never grants access. Omission selects the credential's own workspace.
       schema: {type: string}
   schemas:
+    Login:
+      type: object
+      required: [email, password, account_id]
+      properties: {email: {type: string, format: email}, password: {type: string, format: password, maxLength: 256}, account_id: {type: string}}
+    UserRole:
+      type: string
+      enum: [owner, admin, member, viewer]
+    UserCreate:
+      type: object
+      required: [email, role]
+      properties:
+        email: {type: string, format: email}
+        role: {$ref: '#/components/schemas/UserRole'}
+        account_id: {type: [string, 'null'], description: Internal-administrator bootstrap only; owners inherit their account.}
+        account_type: {type: [string, 'null'], enum: [direct, agency, client, null]}
+        primary_workspace_id: {type: [string, 'null']}
+        workspace_ids: {type: array, items: {type: string}, default: []}
+    InvitationAccept:
+      type: object
+      required: [token]
+      properties:
+        token: {type: string, minLength: 20, maxLength: 200, writeOnly: true}
+        password: {type: [string, 'null'], format: password, minLength: 12, maxLength: 256, writeOnly: true}
     CampaignSequenceState:
       type: object
       required: [day, status, scheduled_at, sent_at]
@@ -272,7 +409,7 @@ components:
         idempotency_key: {type: string, description: Opaque delivery deduplication key; contains no provider credential.}
     Prospect:
       type: object
-      required: [company_name, website, industry, score, why_now, ai_recovery_opportunity, verified_email, email_verified]
+      required: [company_name, website, industry, score, why_now, ai_recovery_opportunity]
       properties:
         company_name: {type: string, minLength: 1, maxLength: 200}
         website: {type: string, pattern: '^https?://'}
@@ -283,8 +420,9 @@ components:
         ai_recovery_opportunity: {type: string, minLength: 1}
         decision_maker_name: {type: [string, 'null']}
         decision_maker_title: {type: [string, 'null']}
-        verified_email: {type: string}
-        email_verified: {type: boolean}
+        verified_email:
+          type: [string, 'null']
+          description: Optional business contact email. It is not outreach-ready unless email_verified is true.
         opening_message: {type: [string, 'null']}
     Industry:
       type: string
