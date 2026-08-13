@@ -340,7 +340,7 @@ def test_same_workspace_duplicate_verification_returns_409_without_partial_chang
 
     response = client.post(
         f"/internal/prospects/{campaign['prospect_id']}/verify-email",
-        json={"verified_email": "already-assigned@example.com"},
+        json={"verified_email": "  ALREADY-ASSIGNED@EXAMPLE.COM  "},
         headers={"Authorization": "Bearer internal-secret"},
     )
     assert response.status_code == 409
