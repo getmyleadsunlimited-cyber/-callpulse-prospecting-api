@@ -51,7 +51,8 @@ def user_token(client, email, role, account_id="account-a", account_type="direct
         "primary_workspace_id": primary_workspace_id, "workspace_ids": workspace_ids or [],
     })
     assert created.status_code == 201, created.text
-    login = client.post("/auth/login", json={"email": email, "password": "correct-horse-battery-staple"})
+    login = client.post("/auth/login", json={"email": email, "password": "correct-horse-battery-staple",
+                                              "account_id": account_id})
     assert login.status_code == 200
     return login.json()["access_token"], created.json()
 
@@ -72,9 +73,9 @@ def test_wrong_token_returns_401(client):
 
 
 def test_customer_roles_and_passwords_are_enforced(client):
+    owner, _ = user_token(client, "owner@example.com", "owner")
     viewer, _ = user_token(client, "viewer@example.com", "viewer")
     member, _ = user_token(client, "member@example.com", "member")
-    owner, _ = user_token(client, "owner@example.com", "owner")
     viewer_headers = {"Authorization": f"Bearer {viewer}"}
     member_headers = {"Authorization": f"Bearer {member}"}
     owner_headers = {"Authorization": f"Bearer {owner}"}
@@ -93,11 +94,20 @@ def test_customer_roles_and_passwords_are_enforced(client):
 
 
 def test_customer_workspace_grants_preserve_tenant_isolation(client):
-    agency, _ = user_token(client, "agency@example.com", "admin", account_id="agency-account",
-                           account_type="agency", primary_workspace_id="agency-home",
-                           workspace_ids=["client-granted"])
-    client_token, _ = user_token(client, "client@example.com", "admin", account_id="client-account",
+    client_token, _ = user_token(client, "client@example.com", "owner", account_id="client-account",
                                  account_type="client", primary_workspace_id="client-granted")
+    agency, agency_user = user_token(client, "agency@example.com", "owner", account_id="agency-account",
+                                     account_type="agency", primary_workspace_id="agency-home")
+    assert client.post("/internal/agency-workspaces", headers={"Authorization": "Bearer internal-secret"},
+                       json={"agency_account_id": "agency-account",
+                             "workspace_id": "client-granted"}).status_code == 201
+    import app
+    with app.SessionLocal() as db:
+        assert db.query(app.WorkspaceAudit).filter_by(
+            workspace_id="client-granted", action="agency_workspace_delegated").count() == 1
+    assert client.put(f"/users/{agency_user['id']}/workspace-access",
+                      headers={"Authorization": "Bearer internal-secret"},
+                      json={"workspace_ids": ["client-granted"]}).status_code == 200
     agency_headers = {"Authorization": f"Bearer {agency}", "X-Workspace-ID": "client-granted"}
     created = client.post("/prospects", headers=agency_headers, json=prospect("isolated@example.com"))
     assert created.status_code == 201
@@ -106,10 +116,118 @@ def test_customer_workspace_grants_preserve_tenant_isolation(client):
     assert client.get(f"/prospects/{created.json()['id']}/campaigns",
                       headers={"Authorization": f"Bearer {client_token}",
                                "X-Workspace-ID": "client-granted"}).status_code == 200
-    direct, _ = user_token(client, "direct@example.com", "viewer", account_id="direct-account",
+    direct, _ = user_token(client, "direct@example.com", "owner", account_id="direct-account",
                            primary_workspace_id="other-workspace")
     assert client.get(f"/prospects/{created.json()['id']}/campaigns",
                       headers={"Authorization": f"Bearer {direct}"}).status_code == 404
+
+
+def test_session_logout_expiry_and_account_wide_revocation(client):
+    token, user = user_token(client, "sessions@example.com", "owner")
+    auth = {"Authorization": f"Bearer {token}"}
+    assert client.get("/me", headers=auth).status_code == 200
+    assert client.post("/auth/logout", headers=auth).status_code == 204
+    assert client.get("/me", headers=auth).status_code == 401
+    token, _ = user_token_login_only(client, "sessions@example.com", "account-a")
+    import app
+    with app.SessionLocal() as db:
+        session = db.query(app.UserSession).filter_by(token_hash=app.hashlib.sha256(token.encode()).hexdigest()).one()
+        session.expires_at = app.utcnow() - timedelta(seconds=1)
+        db.commit()
+    assert client.get("/me", headers={"Authorization": f"Bearer {token}"}).status_code == 401
+    token, _ = user_token_login_only(client, "sessions@example.com", "account-a")
+    auth = {"Authorization": f"Bearer {token}"}
+    assert client.post(f"/users/{user['id']}/revoke-sessions", headers=auth).status_code == 204
+    assert client.get("/me", headers=auth).status_code == 401
+
+
+def user_token_login_only(client, email, account_id):
+    login = client.post("/auth/login", json={"email": email, "password": "correct-horse-battery-staple",
+                                              "account_id": account_id})
+    assert login.status_code == 200, login.text
+    return login.json()["access_token"], login.json()
+
+
+def test_password_change_revokes_all_prior_sessions(client):
+    first, _ = user_token(client, "password@example.com", "owner")
+    second, _ = user_token_login_only(client, "password@example.com", "account-a")
+    response = client.post("/auth/change-password", headers={"Authorization": f"Bearer {first}"}, json={
+        "current_password": "correct-horse-battery-staple", "new_password": "new-correct-horse-password",
+    })
+    assert response.status_code == 204
+    assert client.get("/me", headers={"Authorization": f"Bearer {first}"}).status_code == 401
+    assert client.get("/me", headers={"Authorization": f"Bearer {second}"}).status_code == 401
+
+
+def test_owner_can_revoke_every_session_in_account(client):
+    owner, _ = user_token(client, "revoke-owner@example.com", "owner", account_id="revoke-account",
+                          primary_workspace_id="revoke-workspace")
+    member, _ = user_token(client, "revoke-member@example.com", "member", account_id="revoke-account",
+                           primary_workspace_id="revoke-workspace")
+    assert client.post("/auth/revoke-account", headers={"Authorization": f"Bearer {owner}"}).status_code == 204
+    assert client.get("/me", headers={"Authorization": f"Bearer {owner}"}).status_code == 401
+    assert client.get("/me", headers={"Authorization": f"Bearer {member}"}).status_code == 401
+
+
+def test_last_owner_cannot_be_demoted_or_deactivated(client):
+    token, user = user_token(client, "last-owner@example.com", "owner")
+    auth = {"Authorization": f"Bearer {token}"}
+    assert client.patch(f"/users/{user['id']}/role", headers=auth, json={"role": "admin"}).status_code == 409
+    assert client.post(f"/users/{user['id']}/deactivate", headers=auth).status_code == 409
+    second_token, second = user_token(client, "second-owner@example.com", "owner")
+    assert client.patch(f"/users/{user['id']}/role", headers=auth, json={"role": "admin"}).status_code == 200
+    assert client.post(f"/users/{second['id']}/deactivate",
+                       headers={"Authorization": f"Bearer {second_token}"}).status_code == 409
+
+
+def test_login_throttling_unknown_user_fixed_cost_and_telemetry(client, monkeypatch):
+    import app
+    calls = []
+    original = app.verify_password
+    monkeypatch.setattr(app, "verify_password", lambda password, encoded: calls.append(encoded) or original(password, encoded))
+    payload = {"email": "unknown@example.com", "password": "wrong", "account_id": "unknown-account"}
+    for _ in range(app.LOGIN_MAX_FAILURES):
+        assert client.post("/auth/login", json=payload).status_code == 401
+    assert len(calls) == app.LOGIN_MAX_FAILURES
+    assert all(value == app.DUMMY_PASSWORD_HASH for value in calls)
+    assert client.post("/auth/login", json=payload).status_code == 429
+    assert client.post("/auth/login", json={**payload, "password": "x" * (app.PASSWORD_MAX_LENGTH + 1)}).status_code == 422
+    with app.SessionLocal() as db:
+        events = db.query(app.LoginSecurityEvent).all()
+        assert len(events) == app.LOGIN_MAX_FAILURES + 1
+        assert all("wrong" not in event.reason for event in events)
+
+
+def test_global_identity_can_join_multiple_accounts_without_email_disclosure(client):
+    _, first = user_token(client, "shared@example.com", "owner", account_id="first-account",
+                          primary_workspace_id="first-workspace")
+    user_token(client, "second-bootstrap@example.com", "owner", account_id="second-account",
+               primary_workspace_id="second-workspace")
+    _, second = user_token(client, "shared@example.com", "viewer", account_id="second-account",
+                           primary_workspace_id="second-workspace")
+    assert first["user_id"] == second["user_id"]
+    first_token, _ = user_token_login_only(client, "shared@example.com", "first-account")
+    second_token, _ = user_token_login_only(client, "shared@example.com", "second-account")
+    assert client.get("/me", headers={"Authorization": f"Bearer {first_token}"}).json()["role"] == "owner"
+    assert client.get("/me", headers={"Authorization": f"Bearer {second_token}"}).json()["role"] == "viewer"
+
+
+def test_workspace_ownership_and_audits_are_enforced(client):
+    owner, membership = user_token(client, "audit-owner@example.com", "owner",
+                                   account_id="audit-account", primary_workspace_id="audit-workspace")
+    user_token(client, "foreign@example.com", "owner", account_id="foreign-account",
+               primary_workspace_id="foreign-workspace")
+    auth = {"Authorization": f"Bearer {owner}"}
+    assert client.put(f"/users/{membership['id']}/workspace-access", headers=auth,
+                      json={"workspace_ids": ["foreign-workspace"]}).status_code == 403
+    _, member = user_token(client, "audit-member@example.com", "member",
+                           account_id="audit-account", primary_workspace_id="audit-workspace")
+    assert client.patch(f"/users/{member['id']}/role", headers=auth, json={"role": "admin"}).status_code == 200
+    assert client.post(f"/users/{member['id']}/deactivate", headers=auth).status_code == 200
+    import app
+    with app.SessionLocal() as db:
+        actions = {audit.action for audit in db.query(app.UserAudit).filter_by(account_id="audit-account")}
+        assert {"user_created", "role_changed", "user_deactivated"} <= actions
 
 
 def test_correct_token_allows_protected_endpoint(client):

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Callable
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -28,6 +28,11 @@ elif DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 API_KEY = os.getenv("CALLPULSE_ACTIONS_API_KEY", "")
 INTERNAL_ADMIN_API_KEY = os.getenv("CALLPULSE_INTERNAL_ADMIN_API_KEY", "")
+SESSION_HOURS = int(os.getenv("CALLPULSE_SESSION_HOURS", "12"))
+LOGIN_WINDOW_MINUTES = 15
+LOGIN_MAX_FAILURES = 8
+LOGIN_SOURCE_MAX_FAILURES = 40
+PASSWORD_MAX_LENGTH = 256
 CREDENTIALS_JSON = os.getenv("CALLPULSE_TENANT_CREDENTIALS", "")
 DRY_RUN = os.getenv("CALLPULSE_DRY_RUN", "true").lower() != "false"
 DELIVERY_WEBHOOK = os.getenv("CALLPULSE_DELIVERY_WEBHOOK", "")
@@ -171,33 +176,66 @@ class CanaryExecutionAudit(Base):
     failure_reason: Mapped[str | None] = mapped_column(String(1000))
 
 
+class Account(Base):
+    __tablename__ = "accounts"
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    account_type: Mapped[str] = mapped_column(String(20))
+
+
+class Workspace(Base):
+    __tablename__ = "workspaces"
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    owner_account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), index=True)
+    workspace_type: Mapped[str] = mapped_column(String(20))
+
+
+class AgencyWorkspaceAccess(Base):
+    __tablename__ = "agency_workspace_access"
+    __table_args__ = (UniqueConstraint("agency_account_id", "workspace_id", name="uq_agency_workspace"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    agency_account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), index=True)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+
+
 class User(Base):
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(500))
-    account_id: Mapped[str] = mapped_column(String(100), index=True)
-    account_type: Mapped[str] = mapped_column(String(20))
-    primary_workspace_id: Mapped[str] = mapped_column(String(100))
-    role: Mapped[str] = mapped_column(String(20))
-    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    security_version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    workspace_grants: Mapped[list[UserWorkspaceAccess]] = relationship(cascade="all, delete-orphan")
 
 
-class UserWorkspaceAccess(Base):
-    __tablename__ = "user_workspace_access"
-    __table_args__ = (UniqueConstraint("user_id", "workspace_id", name="uq_user_workspace_access"),)
+class AccountMembership(Base):
+    __tablename__ = "account_memberships"
+    __table_args__ = (UniqueConstraint("user_id", "account_id", name="uq_user_account"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    workspace_id: Mapped[str] = mapped_column(String(100), index=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), index=True)
+    primary_workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"))
+    role: Mapped[str] = mapped_column(String(20))
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    user: Mapped[User] = relationship()
+    workspace_grants: Mapped[list[MembershipWorkspaceAccess]] = relationship(cascade="all, delete-orphan")
+
+
+class MembershipWorkspaceAccess(Base):
+    __tablename__ = "membership_workspace_access"
+    __table_args__ = (UniqueConstraint("membership_id", "workspace_id", name="uq_membership_workspace"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    membership_id: Mapped[int] = mapped_column(ForeignKey("account_memberships.id", ondelete="CASCADE"), index=True)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
 
 
 class UserSession(Base):
     __tablename__ = "user_sessions"
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    membership_id: Mapped[int] = mapped_column(ForeignKey("account_memberships.id", ondelete="CASCADE"), index=True)
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    security_version: Mapped[int] = mapped_column(Integer)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
@@ -209,6 +247,26 @@ class UserAudit(Base):
     target_user_id: Mapped[int] = mapped_column(Integer, index=True)
     action: Mapped[str] = mapped_column(String(50))
     details: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class LoginSecurityEvent(Base):
+    __tablename__ = "login_security_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_key: Mapped[str] = mapped_column(String(64), index=True)
+    source_key: Mapped[str] = mapped_column(String(64), index=True)
+    succeeded: Mapped[bool] = mapped_column(Boolean, default=False)
+    reason: Mapped[str] = mapped_column(String(40))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+
+
+class WorkspaceAudit(Base):
+    __tablename__ = "workspace_audits"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(String(100), index=True)
+    account_id: Mapped[str] = mapped_column(String(100), index=True)
+    action: Mapped[str] = mapped_column(String(50))
+    actor_user_id: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
@@ -226,6 +284,8 @@ class AuthenticatedIdentity:
     access_role: Literal["owner", "admin", "member", "viewer"] = "owner"
     account_id: str | None = None
     user_id: int | None = None
+    membership_id: int | None = None
+    session_id: int | None = None
     email: str | None = None
 
     def permits(self, workspace_id: str) -> bool:
@@ -304,10 +364,18 @@ def require_auth(credentials: HTTPAuthorizationCredentials | None = Depends(bear
     with SessionLocal() as db:
         session = db.scalar(select(UserSession).where(UserSession.token_hash == token_hash))
         user = db.get(User, session.user_id) if session else None
-        if user and user.active:
-            grants = frozenset(x.workspace_id for x in user.workspace_grants)
-            return AuthenticatedIdentity(user.account_type, user.primary_workspace_id, grants,
-                                         user.role, user.account_id, user.id, user.email)
+        membership = db.get(AccountMembership, session.membership_id) if session else None
+        now = utcnow()
+        expires = session.expires_at.replace(tzinfo=timezone.utc) if session and session.expires_at.tzinfo is None else (session.expires_at if session else now)
+        if (user and membership and membership.active and session.revoked_at is None
+                and expires > now and session.security_version == user.security_version):
+            account = db.get(Account, membership.account_id)
+            grants = frozenset(x.workspace_id for x in membership.workspace_grants)
+            return AuthenticatedIdentity(
+                account.account_type, membership.primary_workspace_id, grants,
+                access_role=membership.role, account_id=membership.account_id, user_id=user.id,
+                membership_id=membership.id, session_id=session.id, email=user.email,
+            )
     raise HTTPException(401, "Valid bearer authentication is required")
 
 
@@ -459,13 +527,14 @@ class ConversionIn(BaseModel):
 
 
 class LoginIn(BaseModel):
-    email: str
-    password: str
+    email: str = Field(max_length=320)
+    password: str = Field(max_length=PASSWORD_MAX_LENGTH)
+    account_id: str = Field(min_length=1, max_length=100)
 
 
 class UserCreateIn(BaseModel):
-    email: str
-    password: str = Field(min_length=12)
+    email: str = Field(max_length=320)
+    password: str = Field(min_length=12, max_length=PASSWORD_MAX_LENGTH)
     role: Literal["owner", "admin", "member", "viewer"]
     account_id: str | None = None
     account_type: Literal["direct", "agency", "client"] | None = None
@@ -479,6 +548,16 @@ class RoleChangeIn(BaseModel):
 
 class WorkspaceAccessIn(BaseModel):
     workspace_ids: list[str]
+
+
+class PasswordChangeIn(BaseModel):
+    current_password: str = Field(max_length=PASSWORD_MAX_LENGTH)
+    new_password: str = Field(min_length=12, max_length=PASSWORD_MAX_LENGTH)
+
+
+class AgencyWorkspaceIn(BaseModel):
+    agency_account_id: str
+    workspace_id: str
 
 
 class CampaignSequenceState(BaseModel):
@@ -650,46 +729,148 @@ def add_canary_audit(db: Session, touch: Touch, authorized_by: str, result: str,
     ))
 
 
-def user_dict(user: User) -> dict:
-    return {"id": user.id, "email": user.email, "account_id": user.account_id,
-            "account_type": user.account_type, "primary_workspace_id": user.primary_workspace_id,
-            "role": user.role, "active": user.active,
-            "workspace_ids": sorted(x.workspace_id for x in user.workspace_grants)}
+def membership_dict(membership: AccountMembership) -> dict:
+    return {"id": membership.id, "user_id": membership.user_id, "email": membership.user.email,
+            "account_id": membership.account_id, "role": membership.role, "active": membership.active,
+            "primary_workspace_id": membership.primary_workspace_id,
+            "workspace_ids": sorted(x.workspace_id for x in membership.workspace_grants)}
 
 
-def managed_user(db: Session, user_id: int, identity: AuthenticatedIdentity) -> User:
-    user = db.get(User, user_id)
-    if not user or (identity.role != "internal_admin" and user.account_id != identity.account_id):
+def managed_membership(db: Session, membership_id: int, identity: AuthenticatedIdentity) -> AccountMembership:
+    membership = db.get(AccountMembership, membership_id)
+    if not membership or (identity.role != "internal_admin" and membership.account_id != identity.account_id):
         raise HTTPException(404, "User not found")
-    return user
+    return membership
 
 
-def audit_user(db: Session, identity: AuthenticatedIdentity, user: User, action: str, details: dict) -> None:
-    db.add(UserAudit(account_id=user.account_id, actor_user_id=identity.user_id,
-                     target_user_id=user.id, action=action, details=json.dumps(details, sort_keys=True)))
+def audit_membership(db: Session, identity: AuthenticatedIdentity, membership: AccountMembership,
+                     action: str, details: dict) -> None:
+    db.add(UserAudit(account_id=membership.account_id, actor_user_id=identity.user_id,
+                     target_user_id=membership.user_id, action=action,
+                     details=json.dumps({"membership_id": membership.id, **details}, sort_keys=True)))
+
+
+def login_key(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+# A stable, valid hash ensures unknown identities pay the same PBKDF2 cost.
+DUMMY_PASSWORD_HASH = hash_password("callpulse-dummy-password-never-valid", bytes(16))
+
+
+def record_login_event(db: Session, email: str, account_id: str, source: str,
+                       succeeded: bool, reason: str) -> None:
+    db.add(LoginSecurityEvent(account_key=login_key(f"{email}:{account_id}"),
+                              source_key=login_key(source), succeeded=succeeded, reason=reason))
 
 
 @app.post("/auth/login")
-def login(body: LoginIn, db: Session = Depends(db_session)):
+def login(body: LoginIn, request: Request, db: Session = Depends(db_session)):
+    source = request.client.host if request.client else "unknown"
     try:
         email = normalize_email(body.email)
     except ValueError:
-        raise HTTPException(401, "Invalid email or password")
+        email = body.email.strip().lower()[:320]
+    account_key, source_key = login_key(f"{email}:{body.account_id}"), login_key(source)
+    cutoff = utcnow() - timedelta(minutes=LOGIN_WINDOW_MINUTES)
+    account_throttled = db.scalar(select(LoginSecurityEvent.id).where(
+        LoginSecurityEvent.created_at >= cutoff, LoginSecurityEvent.succeeded.is_(False),
+        LoginSecurityEvent.account_key == account_key,
+    ).order_by(LoginSecurityEvent.id.desc()).offset(LOGIN_MAX_FAILURES - 1))
+    source_throttled = db.scalar(select(LoginSecurityEvent.id).where(
+        LoginSecurityEvent.created_at >= cutoff, LoginSecurityEvent.succeeded.is_(False),
+        LoginSecurityEvent.source_key == source_key,
+    ).order_by(LoginSecurityEvent.id.desc()).offset(LOGIN_SOURCE_MAX_FAILURES - 1))
+    if account_throttled is not None or source_throttled is not None:
+        record_login_event(db, email, body.account_id, source, False, "throttled")
+        db.commit()
+        raise HTTPException(429, "Too many login attempts; try again later")
     user = db.scalar(select(User).where(User.email == email))
-    if not user or not user.active or not verify_password(body.password, user.password_hash):
-        raise HTTPException(401, "Invalid email or password")
+    membership = db.scalar(select(AccountMembership).where(
+        AccountMembership.user_id == user.id, AccountMembership.account_id == body.account_id,
+    )) if user else None
+    password_ok = verify_password(body.password, user.password_hash if user else DUMMY_PASSWORD_HASH)
+    if not user or not membership or not membership.active or not password_ok:
+        record_login_event(db, email, body.account_id, source, False, "invalid_credentials")
+        db.commit()
+        raise HTTPException(401, "Invalid email, account, or password")
     token = secrets.token_urlsafe(32)
-    db.add(UserSession(user_id=user.id, token_hash=hashlib.sha256(token.encode()).hexdigest()))
+    session = UserSession(user_id=user.id, membership_id=membership.id,
+                          token_hash=hashlib.sha256(token.encode()).hexdigest(),
+                          security_version=user.security_version,
+                          expires_at=utcnow() + timedelta(hours=SESSION_HOURS))
+    db.add(session)
+    record_login_event(db, email, body.account_id, source, True, "authenticated")
     db.commit()
-    return {"access_token": token, "token_type": "bearer"}
+    return {"access_token": token, "token_type": "bearer", "expires_in": SESSION_HOURS * 3600}
+
+
+@app.post("/auth/logout", status_code=204, dependencies=[Depends(require_auth)])
+def logout(identity: AuthenticatedIdentity = Depends(require_auth), db: Session = Depends(db_session)):
+    if identity.session_id:
+        db.execute(update(UserSession).where(UserSession.id == identity.session_id).values(revoked_at=utcnow()))
+        db.commit()
+
+
+@app.post("/auth/revoke-all", status_code=204, dependencies=[Depends(require_auth)])
+def revoke_all_sessions(identity: AuthenticatedIdentity = Depends(require_auth), db: Session = Depends(db_session)):
+    if identity.user_id:
+        db.execute(update(UserSession).where(UserSession.user_id == identity.user_id,
+                                             UserSession.revoked_at.is_(None)).values(revoked_at=utcnow()))
+        db.commit()
+
+
+@app.post("/auth/revoke-account", status_code=204, dependencies=[Depends(require_roles("owner"))])
+def revoke_account_sessions(identity: AuthenticatedIdentity = Depends(require_auth), db: Session = Depends(db_session)):
+    membership_ids = select(AccountMembership.id).where(AccountMembership.account_id == identity.account_id)
+    db.execute(update(UserSession).where(UserSession.membership_id.in_(membership_ids),
+                                         UserSession.revoked_at.is_(None)).values(revoked_at=utcnow()))
+    if identity.membership_id:
+        membership = db.get(AccountMembership, identity.membership_id)
+        audit_membership(db, identity, membership, "account_sessions_revoked", {})
+    db.commit()
+
+
+@app.post("/auth/change-password", status_code=204, dependencies=[Depends(require_auth)])
+def change_password(body: PasswordChangeIn, identity: AuthenticatedIdentity = Depends(require_auth),
+                    db: Session = Depends(db_session)):
+    user = db.get(User, identity.user_id)
+    if not user or not verify_password(body.current_password, user.password_hash):
+        raise HTTPException(401, "Current password is invalid")
+    user.password_hash = hash_password(body.new_password)
+    user.security_version += 1
+    db.execute(update(UserSession).where(UserSession.user_id == user.id,
+                                         UserSession.revoked_at.is_(None)).values(revoked_at=utcnow()))
+    membership = db.get(AccountMembership, identity.membership_id)
+    audit_membership(db, identity, membership, "password_changed", {})
+    db.commit()
 
 
 @app.get("/me", dependencies=[Depends(require_auth)])
 def current_user(identity: AuthenticatedIdentity = Depends(require_auth)):
-    return {"id": identity.user_id, "email": identity.email, "account_id": identity.account_id,
-            "role": identity.access_role, "account_type": identity.role,
+    return {"id": identity.user_id, "membership_id": identity.membership_id, "email": identity.email,
+            "account_id": identity.account_id, "role": identity.access_role, "account_type": identity.role,
             "primary_workspace_id": identity.workspace_id,
             "workspace_ids": sorted({identity.workspace_id, *identity.client_workspace_ids})}
+
+
+def authorized_workspace_ids(db: Session, account: Account) -> set[str]:
+    owned = set(db.scalars(select(Workspace.id).where(Workspace.owner_account_id == account.id)))
+    if account.account_type == "agency":
+        owned.update(db.scalars(select(AgencyWorkspaceAccess.workspace_id).where(
+            AgencyWorkspaceAccess.agency_account_id == account.id)))
+    return owned
+
+
+def validate_membership_workspaces(db: Session, account: Account, primary: str,
+                                   requested: set[str]) -> set[str]:
+    allowed = authorized_workspace_ids(db, account)
+    workspaces = requested | {primary}
+    if primary not in allowed or not workspaces <= allowed:
+        raise HTTPException(403, "Workspace is not owned by or delegated to this account")
+    if account.account_type != "agency" and workspaces != {primary}:
+        raise HTTPException(422, "Client and direct users may access only their primary workspace")
+    return workspaces
 
 
 @app.post("/users", status_code=201, dependencies=[Depends(require_roles("owner"))])
@@ -703,76 +884,138 @@ def create_user(body: UserCreateIn, identity: AuthenticatedIdentity = Depends(re
         raise HTTPException(422, "account_id, account_type, and primary_workspace_id are required")
     try:
         email, primary = normalize_email(body.email), validate_workspace_id(primary)
-        workspaces = {validate_workspace_id(x) for x in body.workspace_ids}
+        requested = {validate_workspace_id(x) for x in body.workspace_ids}
         encoded = hash_password(body.password)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
-    if not internal and not all(identity.permits(x) for x in workspaces):
-        raise HTTPException(403, "Cannot grant a workspace outside your authorized set")
-    if account_type != "agency" and workspaces - {primary}:
-        raise HTTPException(422, "Client and direct users may access only their primary workspace")
-    workspaces.add(primary)
-    user = User(email=email, password_hash=encoded, account_id=account_id,
-                account_type=account_type, primary_workspace_id=primary, role=body.role)
-    user.workspace_grants = [UserWorkspaceAccess(workspace_id=x) for x in sorted(workspaces)]
-    db.add(user)
-    try:
+    account = db.get(Account, account_id)
+    if not account:
+        if not internal:
+            raise HTTPException(404, "Account not found")
+        if body.role != "owner":
+            raise HTTPException(422, "The first active membership in an account must be an owner")
+        account = Account(id=account_id, account_type=account_type)
+        db.add(account)
         db.flush()
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(409, "A user with this email already exists")
-    audit_user(db, identity, user, "user_created", {"role": user.role, "workspace_ids": sorted(workspaces)})
+    elif account.account_type != account_type:
+        raise HTTPException(409, "Account type does not match")
+    workspace = db.get(Workspace, primary)
+    if not workspace:
+        if not internal:
+            raise HTTPException(404, "Workspace not found")
+        workspace = Workspace(id=primary, owner_account_id=account.id,
+                              workspace_type="client" if account.account_type == "client" else account.account_type)
+        db.add(workspace)
+        db.flush()
+    workspaces = validate_membership_workspaces(db, account, primary, requested)
+    user = db.scalar(select(User).where(User.email == email))
+    if not user:
+        user = User(email=email, password_hash=encoded)
+        db.add(user)
+        db.flush()
+    existing = db.scalar(select(AccountMembership).where(
+        AccountMembership.user_id == user.id, AccountMembership.account_id == account.id))
+    if existing:
+        # Same response for a local duplicate and an identity already used elsewhere.
+        raise HTTPException(409, "An account membership for this invitation already exists")
+    membership = AccountMembership(user_id=user.id, account_id=account.id,
+                                   primary_workspace_id=primary, role=body.role)
+    membership.workspace_grants = [MembershipWorkspaceAccess(workspace_id=x) for x in sorted(workspaces)]
+    db.add(membership); db.flush()
+    audit_membership(db, identity, membership, "user_created", {"role": body.role, "workspace_ids": sorted(workspaces)})
     db.commit()
-    return user_dict(user)
+    return membership_dict(membership)
 
 
 @app.get("/users", dependencies=[Depends(require_roles("owner"))])
 def list_users(identity: AuthenticatedIdentity = Depends(require_auth), db: Session = Depends(db_session)):
-    query = select(User) if identity.role == "internal_admin" else select(User).where(User.account_id == identity.account_id)
-    return [user_dict(user) for user in db.scalars(query.order_by(User.id))]
+    query = select(AccountMembership) if identity.role == "internal_admin" else select(AccountMembership).where(
+        AccountMembership.account_id == identity.account_id)
+    return [membership_dict(m) for m in db.scalars(query.order_by(AccountMembership.id))]
 
 
-@app.patch("/users/{user_id}/role", dependencies=[Depends(require_roles("owner"))])
-def change_user_role(user_id: int, body: RoleChangeIn, identity: AuthenticatedIdentity = Depends(require_auth),
-                     db: Session = Depends(db_session)):
-    user = managed_user(db, user_id, identity)
-    old = user.role
-    user.role = body.role
-    audit_user(db, identity, user, "role_changed", {"from": old, "to": body.role})
+def last_active_owner(db: Session, membership: AccountMembership) -> bool:
+    if membership.role != "owner" or not membership.active:
+        return False
+    count = db.scalar(select(AccountMembership.id).where(
+        AccountMembership.account_id == membership.account_id,
+        AccountMembership.active.is_(True), AccountMembership.role == "owner",
+        AccountMembership.id != membership.id).limit(1))
+    return count is None
+
+
+@app.patch("/users/{membership_id}/role", dependencies=[Depends(require_roles("owner"))])
+def change_user_role(membership_id: int, body: RoleChangeIn,
+                     identity: AuthenticatedIdentity = Depends(require_auth), db: Session = Depends(db_session)):
+    membership = managed_membership(db, membership_id, identity)
+    db.scalar(select(Account).where(Account.id == membership.account_id).with_for_update())
+    if body.role != "owner" and last_active_owner(db, membership):
+        raise HTTPException(409, "Every account must retain at least one active owner")
+    old = membership.role; membership.role = body.role
+    audit_membership(db, identity, membership, "role_changed", {"from": old, "to": body.role})
     db.commit()
-    return user_dict(user)
+    return membership_dict(membership)
 
 
-@app.post("/users/{user_id}/deactivate", dependencies=[Depends(require_roles("owner"))])
-def deactivate_user(user_id: int, identity: AuthenticatedIdentity = Depends(require_auth),
+@app.post("/users/{membership_id}/deactivate", dependencies=[Depends(require_roles("owner"))])
+def deactivate_user(membership_id: int, identity: AuthenticatedIdentity = Depends(require_auth),
                     db: Session = Depends(db_session)):
-    user = managed_user(db, user_id, identity)
-    if user.id == identity.user_id:
-        raise HTTPException(409, "Owners cannot deactivate their own active session")
-    user.active = False
-    db.execute(UserSession.__table__.delete().where(UserSession.user_id == user.id))
-    audit_user(db, identity, user, "user_deactivated", {})
+    membership = managed_membership(db, membership_id, identity)
+    db.scalar(select(Account).where(Account.id == membership.account_id).with_for_update())
+    if last_active_owner(db, membership):
+        raise HTTPException(409, "Every account must retain at least one active owner")
+    membership.active = False
+    db.execute(update(UserSession).where(UserSession.membership_id == membership.id,
+                                         UserSession.revoked_at.is_(None)).values(revoked_at=utcnow()))
+    audit_membership(db, identity, membership, "user_deactivated", {})
     db.commit()
-    return user_dict(user)
+    return membership_dict(membership)
 
 
-@app.put("/users/{user_id}/workspace-access", dependencies=[Depends(require_roles("owner"))])
-def change_workspace_access(user_id: int, body: WorkspaceAccessIn,
+@app.post("/users/{membership_id}/revoke-sessions", status_code=204,
+          dependencies=[Depends(require_roles("owner"))])
+def revoke_membership_sessions(membership_id: int, identity: AuthenticatedIdentity = Depends(require_auth),
+                               db: Session = Depends(db_session)):
+    membership = managed_membership(db, membership_id, identity)
+    db.execute(update(UserSession).where(UserSession.membership_id == membership.id,
+                                         UserSession.revoked_at.is_(None)).values(revoked_at=utcnow()))
+    audit_membership(db, identity, membership, "sessions_revoked", {})
+    db.commit()
+
+
+@app.put("/users/{membership_id}/workspace-access", dependencies=[Depends(require_roles("owner"))])
+def change_workspace_access(membership_id: int, body: WorkspaceAccessIn,
                             identity: AuthenticatedIdentity = Depends(require_auth), db: Session = Depends(db_session)):
-    user = managed_user(db, user_id, identity)
-    try:
-        workspaces = {validate_workspace_id(x) for x in body.workspace_ids} | {user.primary_workspace_id}
-    except ValueError as exc:
-        raise HTTPException(422, str(exc))
-    if identity.role != "internal_admin" and not all(identity.permits(x) for x in workspaces):
-        raise HTTPException(403, "Cannot grant a workspace outside your authorized set")
-    if user.account_type != "agency" and workspaces != {user.primary_workspace_id}:
-        raise HTTPException(422, "Client and direct users may access only their primary workspace")
-    old = sorted(x.workspace_id for x in user.workspace_grants)
-    user.workspace_grants = [UserWorkspaceAccess(workspace_id=x) for x in sorted(workspaces)]
-    audit_user(db, identity, user, "workspace_access_changed", {"from": old, "to": sorted(workspaces)})
+    membership = managed_membership(db, membership_id, identity)
+    try: requested = {validate_workspace_id(x) for x in body.workspace_ids}
+    except ValueError as exc: raise HTTPException(422, str(exc))
+    account = db.get(Account, membership.account_id)
+    workspaces = validate_membership_workspaces(db, account, membership.primary_workspace_id, requested)
+    old = sorted(x.workspace_id for x in membership.workspace_grants)
+    membership.workspace_grants = [MembershipWorkspaceAccess(workspace_id=x) for x in sorted(workspaces)]
+    audit_membership(db, identity, membership, "workspace_access_changed", {"from": old, "to": sorted(workspaces)})
     db.commit()
-    return user_dict(user)
+    return membership_dict(membership)
+
+
+@app.post("/internal/agency-workspaces", status_code=201,
+          dependencies=[Depends(require_roles("owner"))])
+def delegate_agency_workspace(body: AgencyWorkspaceIn,
+                              identity: AuthenticatedIdentity = Depends(require_auth), db: Session = Depends(db_session)):
+    if identity.role != "internal_admin":
+        raise HTTPException(403, "Internal administrator authentication is required")
+    agency, workspace = db.get(Account, body.agency_account_id), db.get(Workspace, body.workspace_id)
+    if not agency or agency.account_type != "agency" or not workspace or workspace.workspace_type != "client":
+        raise HTTPException(404, "Agency or client workspace not found")
+    item = db.scalar(select(AgencyWorkspaceAccess).where(
+        AgencyWorkspaceAccess.agency_account_id == agency.id,
+        AgencyWorkspaceAccess.workspace_id == workspace.id))
+    if not item:
+        db.add(AgencyWorkspaceAccess(agency_account_id=agency.id, workspace_id=workspace.id))
+        db.add(WorkspaceAudit(workspace_id=workspace.id, account_id=agency.id,
+                              action="agency_workspace_delegated", actor_user_id=identity.user_id))
+        db.commit()
+    return {"agency_account_id": agency.id, "workspace_id": workspace.id}
 
 
 @app.get("/health")
