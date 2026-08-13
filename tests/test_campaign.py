@@ -25,6 +25,7 @@ VERTICALS = [
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/test.db")
     monkeypatch.setenv("CALLPULSE_ACTIONS_API_KEY", "secret")
+    monkeypatch.setenv("CALLPULSE_INTERNAL_ADMIN_API_KEY", "internal-secret")
     monkeypatch.setenv("CALLPULSE_TENANT_CREDENTIALS", json.dumps({
         "agency-a-token": {"role": "agency", "workspace_id": "agency-a",
                            "client_workspace_ids": ["client-a"]},
@@ -40,6 +41,19 @@ def client(tmp_path, monkeypatch):
 
 
 def headers(): return {"Authorization": "Bearer secret"}
+
+
+def create_verified_prospect(client, body, request_headers=None):
+    request_headers = request_headers or headers()
+    created = client.post("/prospects", json=body, headers=request_headers)
+    assert created.status_code == 201, created.text
+    internal_headers = {"Authorization": "Bearer internal-secret"}
+    if "X-Workspace-ID" in request_headers:
+        internal_headers["X-Workspace-ID"] = request_headers["X-Workspace-ID"]
+    verified = client.post(f"/internal/prospects/{created.json()['id']}/verify-email",
+                           json={"verified_email": body["verified_email"]}, headers=internal_headers)
+    assert verified.status_code == 200, verified.text
+    return verified
 
 
 def prospect(email="verified@example.com", verified=True):
@@ -183,10 +197,172 @@ context.testDone.then(() => process.stdout.write(JSON.stringify(requests[0].body
     assert json.loads(completed.stdout)["industry"] == industry
 
 
-def test_verified_email_and_industry_are_required(client):
-    assert client.post("/prospects", json=prospect(verified=False), headers=headers()).status_code == 422
+def test_industry_is_required(client):
     body = prospect(); body["industry"] = "Unknown"
     assert client.post("/prospects", json=body, headers=headers()).status_code == 422
+
+
+def test_public_caller_cannot_self_assert_verified_email(client):
+    response = client.post("/prospects", json=prospect("ready@example.com", verified=True), headers=headers())
+    assert response.status_code == 201
+    assert response.json()["verified_email"] == "ready@example.com"
+    assert response.json()["email_verified"] is False
+    assert client.post(f"/prospects/{response.json()['id']}/campaigns",
+                       json={"idempotency_key": "self-asserted"}, headers=headers()).status_code == 422
+
+
+def test_internal_verification_transition_makes_exact_email_ready(client):
+    created = client.post("/prospects", json=prospect("trusted@example.com", verified=False), headers=headers())
+    verified = client.post(f"/internal/prospects/{created.json()['id']}/verify-email",
+                           json={"verified_email": "Trusted@Example.com"},
+                           headers={"Authorization": "Bearer internal-secret"})
+    assert verified.status_code == 200
+    assert verified.json()["verified_email"] == "trusted@example.com"
+    assert verified.json()["email_verified"] is True
+    assert client.post(f"/prospects/{created.json()['id']}/campaigns",
+                       json={"idempotency_key": "trusted-transition"}, headers=headers()).status_code == 201
+
+
+def test_customer_cannot_invoke_internal_verification(client):
+    created = client.post("/prospects", json=prospect("blocked-verify@example.com", False), headers=headers()).json()
+    response = client.post(f"/internal/prospects/{created['id']}/verify-email",
+                           json={"verified_email": "blocked-verify@example.com"}, headers=headers())
+    assert response.status_code == 403
+
+
+def test_existing_trusted_verified_prospect_remains_campaign_compatible(client):
+    import app
+    with app.SessionLocal() as db:
+        existing = app.Prospect(
+            company_name="Existing Verified", website="https://existing.example", industry="Roofing",
+            location="Houston, TX", score=90, why_now="Existing trusted record",
+            ai_recovery_opportunity="Lead recovery", workspace_id=app.DEFAULT_WORKSPACE_ID,
+            verified_email="existing-verified@example.com", email_verified=True,
+        )
+        db.add(existing)
+        db.commit()
+        prospect_id = existing.id
+    response = client.post(f"/prospects/{prospect_id}/campaigns",
+                           json={"idempotency_key": "existing-verified"}, headers=headers())
+    assert response.status_code == 201
+
+
+def test_changed_verified_email_invalidates_campaign_authorization_and_deliveries(client, monkeypatch):
+    import app
+    provider_class = configure_mock(app, monkeypatch)
+    _, campaign = launch(client, "original-recipient@example.com",
+                         datetime.now(timezone.utc) - timedelta(minutes=1))
+    assert authorize(client, campaign["id"]).status_code == 200
+
+    changed = client.post(
+        f"/internal/prospects/{campaign['prospect_id']}/verify-email",
+        json={"verified_email": "replacement@example.com"},
+        headers={"Authorization": "Bearer internal-secret"},
+    )
+    assert changed.status_code == 200
+    with app.SessionLocal() as db:
+        stored_campaign = db.get(app.Campaign, campaign["id"])
+        assert stored_campaign.live_authorized is False
+        assert stored_campaign.live_authorized_at is None
+        assert stored_campaign.live_authorized_by is None
+        assert stored_campaign.authorized_recipient_email is None
+        assert stored_campaign.dry_run is True
+        assert all(touch.dry_run for touch in stored_campaign.touches if touch.sent_at is None)
+        audit = db.query(app.EmailVerificationAudit).order_by(app.EmailVerificationAudit.id.desc()).first()
+        assert audit.old_email == "original-recipient@example.com"
+        assert audit.new_email == "replacement@example.com"
+        assert audit.verifier_identity == "internal_admin"
+        assert json.loads(audit.invalidated_campaign_ids) == [campaign["id"]]
+
+    blocked = execute_canary(client, campaign)
+    assert blocked.status_code == 409
+    assert provider_class.calls == []
+    assert "campaign is not live authorized" in blocked.json()["failures"]
+
+
+def test_canary_rejects_recipient_drift_from_authorization_binding(client, monkeypatch):
+    import app
+    provider_class = configure_mock(app, monkeypatch)
+    _, campaign = launch(client, "bound@example.com", datetime.now(timezone.utc) - timedelta(minutes=1))
+    assert authorize(client, campaign["id"]).status_code == 200
+    with app.SessionLocal() as db:
+        prospect_row = db.get(app.Prospect, campaign["prospect_id"])
+        prospect_row.verified_email = "drifted@example.com"
+        prospect_row.email_verified = True
+        db.commit()
+    preflight = client.get(
+        f"/deliveries/{campaign['touches'][0]['id']}/canary-preflight", headers=headers())
+    assert preflight.status_code == 200
+    assert "campaign authorization recipient does not match the current verified email" in preflight.json()["failures"]
+    assert execute_canary(client, campaign).status_code == 409
+    assert provider_class.calls == []
+
+
+def test_new_recipient_suppression_blocks_reauthorization(client):
+    _, campaign = launch(client, "before-suppression@example.com")
+    assert authorize(client, campaign["id"]).status_code == 200
+    assert client.post("/suppressions", json={
+        "email": "suppressed-replacement@example.com", "reason": "prior opt-out",
+    }, headers=headers()).status_code == 201
+    assert client.post(
+        f"/internal/prospects/{campaign['prospect_id']}/verify-email",
+        json={"verified_email": "suppressed-replacement@example.com"},
+        headers={"Authorization": "Bearer internal-secret"},
+    ).status_code == 200
+    response = authorize(client, campaign["id"])
+    assert response.status_code == 409
+    assert "prospect is suppressed" in response.json()["failures"]
+
+
+def test_equivalent_normalized_email_does_not_invalidate_authorization(client):
+    import app
+    _, campaign = launch(client, "same@example.com")
+    assert authorize(client, campaign["id"]).status_code == 200
+    response = client.post(
+        f"/internal/prospects/{campaign['prospect_id']}/verify-email",
+        json={"verified_email": "  SAME@EXAMPLE.COM  "},
+        headers={"Authorization": "Bearer internal-secret"},
+    )
+    assert response.status_code == 200
+    with app.SessionLocal() as db:
+        stored_campaign = db.get(app.Campaign, campaign["id"])
+        assert stored_campaign.live_authorized is True
+        assert stored_campaign.authorized_recipient_email == "same@example.com"
+        audit = db.query(app.EmailVerificationAudit).order_by(app.EmailVerificationAudit.id.desc()).first()
+        assert json.loads(audit.invalidated_campaign_ids) == []
+
+
+def test_prospect_created_with_unverified_email_is_not_email_ready(client):
+    response = client.post("/prospects", json=prospect("unverified@example.com", verified=False), headers=headers())
+    assert response.status_code == 201
+    assert response.json()["verified_email"] == "unverified@example.com"
+    assert response.json()["email_verified"] is False
+    launch = client.post(f"/prospects/{response.json()['id']}/campaigns",
+                         json={"idempotency_key": "unverified-email"}, headers=headers())
+    assert launch.status_code == 422
+
+
+def test_prospect_created_without_email_is_not_email_ready(client):
+    body = prospect()
+    body.pop("verified_email")
+    body.pop("email_verified")
+    response = client.post("/prospects", json=body, headers=headers())
+    assert response.status_code == 201
+    assert response.json()["verified_email"] is None
+    assert response.json()["email_verified"] is False
+    launch = client.post(f"/prospects/{response.json()['id']}/campaigns",
+                         json={"idempotency_key": "missing-email"}, headers=headers())
+    assert launch.status_code == 422
+
+
+def test_email_verified_input_without_an_address_is_ignored(client):
+    body = prospect()
+    body.pop("verified_email")
+    body["email_verified"] = True
+    response = client.post("/prospects", json=body, headers=headers())
+    assert response.status_code == 201
+    assert response.json()["verified_email"] is None
+    assert response.json()["email_verified"] is False
 
 
 @pytest.mark.parametrize("industry", VERTICALS)
@@ -209,14 +385,14 @@ def test_score_below_65_is_rejected(client):
 def test_industry_helper_becomes_day_zero_message(client):
     body = prospect()
     body.update(industry="Roofing", opening_message=None)
-    p = client.post("/prospects", json=body, headers=headers()).json()
+    p = create_verified_prospect(client, body).json()
     campaign = client.post(f"/prospects/{p['id']}/campaigns", json={"idempotency_key": "roofing-123"}, headers=headers())
     assert campaign.status_code == 201
     assert "inspection and replacement visitors" in campaign.json()["touches"][0]["message"]
 
 
 def test_campaign_days_idempotency_launcher_and_reply_stop(client):
-    p = client.post("/prospects", json=prospect(), headers=headers()).json()
+    p = create_verified_prospect(client, prospect()).json()
     start = datetime.now(timezone.utc) - timedelta(days=4)
     payload = {"start_at": start.isoformat(), "idempotency_key": "request-123"}
     first = client.post(f"/prospects/{p['id']}/campaigns", json=payload, headers=headers())
@@ -239,7 +415,7 @@ def test_campaign_inspection_is_authenticated_and_missing_resources_are_404(clie
 def test_inspection_returns_three_dry_run_deliveries_without_changing_state(client):
     import app
 
-    p = client.post("/prospects", json=prospect(), headers=headers()).json()
+    p = create_verified_prospect(client, prospect()).json()
     launched = client.post(
         f"/prospects/{p['id']}/campaigns",
         json={"start_at": datetime.now(timezone.utc).isoformat(), "idempotency_key": "inspect-123"},
@@ -271,7 +447,7 @@ def test_inspection_returns_three_dry_run_deliveries_without_changing_state(clie
 
 
 def test_suppression_blocks_launch(client):
-    p = client.post("/prospects", json=prospect("blocked@example.com"), headers=headers()).json()
+    p = create_verified_prospect(client, prospect("blocked@example.com")).json()
     assert client.post("/suppressions", json={"email": "BLOCKED@example.com", "reason": "opt-out"}, headers=headers()).status_code == 201
     response = client.post(f"/prospects/{p['id']}/campaigns", json={"idempotency_key": "request-456"}, headers=headers())
     assert response.status_code == 409
@@ -329,7 +505,7 @@ def test_render_start_applies_idempotent_location_migration_with_dry_run_enabled
 
 
 def launch(client, email="live@example.com", start=None):
-    created = client.post("/prospects", json=prospect(email), headers=headers()).json()
+    created = create_verified_prospect(client, prospect(email)).json()
     response = client.post(
         f"/prospects/{created['id']}/campaigns",
         json={"idempotency_key": f"launch-{email}", "start_at": (start or datetime.now(timezone.utc)).isoformat()},
@@ -909,7 +1085,7 @@ def test_foreign_ids_remain_404_inside_an_authorized_workspace(client):
 
 def test_every_tenant_operation_rejects_header_only_authorization_bypass(client):
     own = tenant_headers("agency-a-token", "client-a")
-    created = client.post("/prospects", json=prospect("boundary@example.com"), headers=own).json()
+    created = create_verified_prospect(client, prospect("boundary@example.com"), own).json()
     campaign = client.post(f"/prospects/{created['id']}/campaigns",
                            json={"idempotency_key": "boundary-request"}, headers=own).json()
     delivery_id = campaign["touches"][0]["id"]

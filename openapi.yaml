@@ -81,6 +81,23 @@ paths:
                 idempotency_key: {type: string, minLength: 8, maxLength: 100}
                 start_at: {type: [string, 'null'], format: date-time}
       responses: {'201': {description: Idempotent campaign with Day 0/3/6 touches}, '409': {description: Suppressed}}
+  /internal/prospects/{prospect_id}/verify-email:
+    post:
+      operationId: verifyProspectEmailInternal
+      summary: Internal-admin-only transition that verifies an exact normalized email and invalidates prior recipient authorization on change.
+      parameters: [{$ref: '#/components/parameters/prospectId'}, {$ref: '#/components/parameters/workspaceId'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [verified_email]
+              properties: {verified_email: {type: string, format: email}}
+      responses:
+        '200': {description: Prospect email normalized and marked verified; changed recipients invalidate campaign authorization and unsent delivery eligibility}
+        '403': {description: Internal administrator authentication required}
+        '404': {description: Prospect not found in the selected workspace}
   /campaigns/{campaign_id}/deliveries:
     get:
       operationId: inspectCampaignDeliveries
@@ -272,7 +289,7 @@ components:
         idempotency_key: {type: string, description: Opaque delivery deduplication key; contains no provider credential.}
     Prospect:
       type: object
-      required: [company_name, website, industry, score, why_now, ai_recovery_opportunity, verified_email, email_verified]
+      required: [company_name, website, industry, score, why_now, ai_recovery_opportunity]
       properties:
         company_name: {type: string, minLength: 1, maxLength: 200}
         website: {type: string, pattern: '^https?://'}
@@ -283,8 +300,9 @@ components:
         ai_recovery_opportunity: {type: string, minLength: 1}
         decision_maker_name: {type: [string, 'null']}
         decision_maker_title: {type: [string, 'null']}
-        verified_email: {type: string}
-        email_verified: {type: boolean}
+        verified_email:
+          type: [string, 'null']
+          description: Optional business contact email. It is not outreach-ready unless email_verified is true.
         opening_message: {type: [string, 'null']}
     Industry:
       type: string

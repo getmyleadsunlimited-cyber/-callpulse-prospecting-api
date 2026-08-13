@@ -112,6 +112,7 @@ class Campaign(Base):
     live_authorized: Mapped[bool] = mapped_column(Boolean, default=False)
     live_authorized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     live_authorized_by: Mapped[str | None] = mapped_column(String(200))
+    authorized_recipient_email: Mapped[str | None] = mapped_column(String(320))
     prospect: Mapped[Prospect] = relationship(back_populates="campaigns")
     touches: Mapped[list[Touch]] = relationship(back_populates="campaign", cascade="all, delete-orphan")
 
@@ -168,6 +169,18 @@ class CanaryExecutionAudit(Base):
     provider_correlation_id: Mapped[str | None] = mapped_column(String(300))
     result: Mapped[str] = mapped_column(String(30))
     failure_reason: Mapped[str | None] = mapped_column(String(1000))
+
+
+class EmailVerificationAudit(Base):
+    __tablename__ = "email_verification_audits"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    prospect_id: Mapped[int] = mapped_column(ForeignKey("prospects.id", ondelete="CASCADE"), index=True)
+    workspace_id: Mapped[str] = mapped_column(String(100), index=True)
+    old_email: Mapped[str | None] = mapped_column(String(320))
+    new_email: Mapped[str] = mapped_column(String(320))
+    verifier_identity: Mapped[str] = mapped_column(String(200))
+    verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    invalidated_campaign_ids: Mapped[str] = mapped_column(Text, default="[]")
 
 
 Base.metadata.create_all(engine)
@@ -317,8 +330,7 @@ class ProspectIn(BaseModel):
     ai_recovery_opportunity: str = Field(min_length=1)
     decision_maker_name: str | None = None
     decision_maker_title: str | None = None
-    verified_email: str
-    email_verified: bool
+    verified_email: str | None = None
     opening_message: str | None = None
 
     @field_validator("industry")
@@ -327,6 +339,16 @@ class ProspectIn(BaseModel):
         if value not in INDUSTRIES:
             raise ValueError("Select a supported industry")
         return value
+
+    @field_validator("verified_email")
+    @classmethod
+    def validate_email(cls, value: str | None) -> str | None:
+        return normalize_email(value) if value is not None else None
+
+
+
+class TrustedEmailVerificationIn(BaseModel):
+    verified_email: str
 
     @field_validator("verified_email")
     @classmethod
@@ -480,6 +502,9 @@ def can_execute_delivery(touch: Touch, campaign: Campaign, prospect: Prospect,
     if not campaign.live_authorized: failures.append("campaign is not live authorized")
     if campaign.dry_run: failures.append("campaign is in dry-run mode")
     if campaign.status != "active": failures.append("campaign is not active")
+    if (not campaign.authorized_recipient_email
+            or campaign.authorized_recipient_email != prospect.verified_email):
+        failures.append("campaign authorization recipient does not match the current verified email")
     if touch.dry_run: failures.append("delivery is in dry-run mode")
     if touch.sent_at is not None: failures.append("delivery was already sent or simulated")
     if touch.skipped: failures.append("delivery is skipped")
@@ -695,9 +720,8 @@ def industry_buttons():
 
 @app.post("/prospects", status_code=201, dependencies=[Depends(require_auth)])
 def create_prospect(body: ProspectIn, workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
-    if not body.email_verified:
-        raise HTTPException(422, "Only independently verified email addresses qualify")
-    p = Prospect(workspace_id=workspace_id, **body.model_dump())
+    # Trusted verification is never accepted from this customer-facing request.
+    p = Prospect(workspace_id=workspace_id, email_verified=False, **body.model_dump())
     db.add(p)
     try:
         db.commit()
@@ -705,6 +729,54 @@ def create_prospect(body: ProspectIn, workspace_id: str = Depends(workspace_cont
         db.rollback()
         raise HTTPException(409, "Prospect email already exists")
     return prospect_dict(p)
+
+
+@app.post("/internal/prospects/{prospect_id}/verify-email", dependencies=[Depends(require_auth)])
+def verify_prospect_email(prospect_id: int, body: TrustedEmailVerificationIn,
+                          identity: AuthenticatedIdentity = Depends(require_auth),
+                          workspace_id: str = Depends(workspace_context), db: Session = Depends(db_session)):
+    if identity.role != "internal_admin":
+        raise HTTPException(403, "Internal administrator authentication is required")
+    prospect = db.scalar(select(Prospect).where(
+        Prospect.id == prospect_id, Prospect.workspace_id == workspace_id).with_for_update())
+    if not prospect:
+        raise HTTPException(404, "Prospect not found")
+    old_email = prospect.verified_email
+    if old_email is not None:
+        try:
+            old_email = normalize_email(old_email)
+        except ValueError:
+            # Preserve malformed legacy data in the audit; it can never compare
+            # equal to the newly validated address or pass an outreach gate.
+            pass
+    changed = old_email != body.verified_email
+    invalidated_campaign_ids: list[int] = []
+    if changed:
+        for campaign in prospect.campaigns:
+            invalidated_campaign_ids.append(campaign.id)
+            campaign.live_authorized = False
+            campaign.live_authorized_at = None
+            campaign.live_authorized_by = None
+            campaign.authorized_recipient_email = None
+            campaign.dry_run = True
+            for touch in campaign.touches:
+                if touch.sent_at is None:
+                    touch.dry_run = True
+                    if touch.execution_status != "sending":
+                        touch.execution_status = "pending"
+                    touch.last_execution_error = "recipient changed; campaign authorization invalidated"
+    prospect.verified_email = body.verified_email
+    prospect.email_verified = True
+    verified_at = utcnow()
+    prospect.updated_at = verified_at
+    db.add(EmailVerificationAudit(
+        prospect_id=prospect.id, workspace_id=workspace_id,
+        old_email=old_email, new_email=body.verified_email,
+        verifier_identity=identity.role, verified_at=verified_at,
+        invalidated_campaign_ids=json.dumps(invalidated_campaign_ids),
+    ))
+    db.commit()
+    return prospect_dict(prospect)
 
 
 @app.get("/prospects", dependencies=[Depends(require_auth)])
@@ -767,6 +839,7 @@ def authorize_live(campaign_id: int, body: LiveAuthorizationIn, workspace_id: st
         campaign.live_authorized = True
         campaign.live_authorized_at = utcnow()
         campaign.live_authorized_by = body.authorized_by.strip()
+        campaign.authorized_recipient_email = campaign.prospect.verified_email
         campaign.dry_run = False
         for touch in campaign.touches:
             if touch.sent_at is None and not touch.skipped and not touch.cancelled:
@@ -941,7 +1014,7 @@ def canary_execute(campaign_id: int, body: CanaryExecutionIn, workspace_id: str 
 
     try:
         result = provider.send(
-            sender=EMAIL_FROM, recipient=touch.campaign.prospect.verified_email,
+            sender=EMAIL_FROM, recipient=touch.campaign.authorized_recipient_email,
             subject=touch.subject, message=touch.message, idempotency_key=touch.idempotency_key,
         )
     except Exception as exc:
