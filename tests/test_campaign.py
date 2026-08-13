@@ -303,6 +303,48 @@ def test_expired_invitation_cannot_be_accepted(client):
     }).status_code == 410
 
 
+def test_existing_identity_with_only_inactive_memberships_can_accept_invitation(client):
+    import app
+    inactive_token, inactive = user_token(
+        client, "inactive-invitee@example.com", "owner",
+        account_id="inactive-account", primary_workspace_id="inactive-workspace",
+    )
+    active_owner, _ = user_token(
+        client, "remaining-owner@example.com", "owner",
+        account_id="inactive-account", primary_workspace_id="inactive-workspace",
+    )
+    assert client.post(
+        f"/users/{inactive['id']}/deactivate",
+        headers={"Authorization": f"Bearer {active_owner}"},
+    ).status_code == 200
+    assert client.get("/me", headers={"Authorization": f"Bearer {inactive_token}"}).status_code == 401
+
+    delivered = []
+    original = app.deliver_invitation_token
+    app.deliver_invitation_token = lambda email, token: delivered.append(token)
+    try:
+        invited = client.post("/users", headers={"Authorization": "Bearer internal-secret"}, json={
+            "email": "inactive-invitee@example.com", "role": "owner",
+            "account_id": "new-account", "account_type": "direct",
+            "primary_workspace_id": "new-workspace", "workspace_ids": [],
+        })
+    finally:
+        app.deliver_invitation_token = original
+    assert invited.status_code == 201
+    assert client.post("/invitations/accept", json={
+        "token": delivered[0], "password": "incorrect-password-value",
+    }).status_code == 401
+    accepted = client.post("/invitations/accept", json={
+        "token": delivered[0], "password": "correct-horse-battery-staple",
+    })
+    assert accepted.status_code == 201
+    assert accepted.json()["account_id"] == "new-account"
+    assert client.post("/auth/login", json={
+        "email": "inactive-invitee@example.com",
+        "password": "correct-horse-battery-staple", "account_id": "new-account",
+    }).status_code == 200
+
+
 def test_workspace_ownership_and_audits_are_enforced(client):
     owner, membership = user_token(client, "audit-owner@example.com", "owner",
                                    account_id="audit-account", primary_workspace_id="audit-workspace")

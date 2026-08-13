@@ -1015,8 +1015,14 @@ def accept_invitation(body: InvitationAcceptIn, identity: AuthenticatedIdentity 
         raise HTTPException(410, "Invitation is invalid or expired")
     user = db.scalar(select(User).where(User.email == invitation.email))
     if user:
-        if not identity or identity.user_id != user.id:
-            raise HTTPException(401, "Authenticate as the invited identity to accept this invitation")
+        authenticated_as_user = identity is not None and identity.user_id == user.id
+        password_proves_user = (body.password is not None
+                                and verify_password(body.password, user.password_hash))
+        if not authenticated_as_user and not password_proves_user:
+            raise HTTPException(
+                401,
+                "Authenticate as the invited identity or provide its current password",
+            )
     else:
         if identity is not None:
             raise HTTPException(403, "Invitation does not belong to the authenticated identity")
@@ -1042,7 +1048,10 @@ def accept_invitation(body: InvitationAcceptIn, identity: AuthenticatedIdentity 
                                    for x in json.loads(invitation.workspace_ids_json)]
     db.add(membership); db.flush()
     invitation.accepted_at = utcnow()
-    audit_membership(db, identity or AuthenticatedIdentity("direct", invitation.primary_workspace_id),
+    audit_identity = identity or AuthenticatedIdentity(
+        "direct", invitation.primary_workspace_id, user_id=user.id, email=user.email,
+    )
+    audit_membership(db, audit_identity,
                      membership, "invitation_accepted", {"role": membership.role})
     db.commit()
     return membership_dict(membership)
@@ -1588,6 +1597,16 @@ def canary_execute(campaign_id: int, body: CanaryExecutionIn, workspace_id: str 
             "detail": "Canary execution blocked by safety checks",
             "failures": ["another execution is already in flight"],
         })
+
+    # Serialize the final safety decision and provider call with every trusted
+    # recipient mutation. The verification transition locks this same prospect
+    # row, so it either completes before this check or waits until the send and
+    # its audit state are committed.
+    prospect_id = campaign.prospect_id
+    db.scalar(select(Prospect).where(
+        Prospect.id == prospect_id,
+        Prospect.workspace_id == workspace_id,
+    ).with_for_update())
 
     # Re-load and re-check all mutable stop state immediately before the sole provider call.
     db.expire_all()
