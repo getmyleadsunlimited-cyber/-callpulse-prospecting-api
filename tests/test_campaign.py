@@ -477,6 +477,8 @@ def test_approve_nonexistent_or_foreign_workspace_prospect_returns_404(client):
 
 def test_approve_requires_mutation_role_and_authorized_workspace(client):
     created = client.post("/prospects", json=prospect("role-approval@example.com", False), headers=headers()).json()
+    user_token(client, "approval-owner@example.com", "owner",
+               account_id="approval-account", primary_workspace_id="callpulse-direct")
     viewer, _ = user_token(client, "approval-viewer@example.com", "viewer",
                            account_id="approval-account", primary_workspace_id="callpulse-direct")
     assert client.post(f"/prospects/{created['id']}/approve",
