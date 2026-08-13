@@ -741,6 +741,13 @@ def verify_prospect_email(prospect_id: int, body: TrustedEmailVerificationIn,
         Prospect.id == prospect_id, Prospect.workspace_id == workspace_id).with_for_update())
     if not prospect:
         raise HTTPException(404, "Prospect not found")
+    duplicate = db.scalar(select(Prospect.id).where(
+        Prospect.workspace_id == workspace_id,
+        Prospect.verified_email == body.verified_email,
+        Prospect.id != prospect.id,
+    ).limit(1))
+    if duplicate is not None:
+        raise HTTPException(409, "Verified email is already assigned in this workspace")
     old_email = prospect.verified_email
     if old_email is not None:
         try:
@@ -775,7 +782,14 @@ def verify_prospect_email(prospect_id: int, body: TrustedEmailVerificationIn,
         verifier_identity=identity.role, verified_at=verified_at,
         invalidated_campaign_ids=json.dumps(invalidated_campaign_ids),
     ))
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # The unique constraint is authoritative: another request may assign the
+        # address after the pre-check. Roll back every in-transaction mutation,
+        # including campaign invalidation, touch state, and the audit insert.
+        db.rollback()
+        raise HTTPException(409, "Verified email is already assigned in this workspace")
     return prospect_dict(prospect)
 
 

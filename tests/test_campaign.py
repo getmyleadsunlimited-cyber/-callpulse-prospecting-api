@@ -332,6 +332,86 @@ def test_equivalent_normalized_email_does_not_invalidate_authorization(client):
         assert json.loads(audit.invalidated_campaign_ids) == []
 
 
+def test_same_workspace_duplicate_verification_returns_409_without_partial_changes(client):
+    import app
+    create_verified_prospect(client, prospect("already-assigned@example.com"))
+    _, campaign = launch(client, "original-before-conflict@example.com")
+    assert authorize(client, campaign["id"]).status_code == 200
+
+    response = client.post(
+        f"/internal/prospects/{campaign['prospect_id']}/verify-email",
+        json={"verified_email": "already-assigned@example.com"},
+        headers={"Authorization": "Bearer internal-secret"},
+    )
+    assert response.status_code == 409
+    with app.SessionLocal() as db:
+        prospect_row = db.get(app.Prospect, campaign["prospect_id"])
+        stored_campaign = db.get(app.Campaign, campaign["id"])
+        assert prospect_row.verified_email == "original-before-conflict@example.com"
+        assert prospect_row.email_verified is True
+        assert stored_campaign.live_authorized is True
+        assert stored_campaign.authorized_recipient_email == "original-before-conflict@example.com"
+        assert stored_campaign.dry_run is False
+        assert all(not touch.dry_run for touch in stored_campaign.touches)
+        assert db.query(app.EmailVerificationAudit).filter_by(
+            prospect_id=campaign["prospect_id"], new_email="already-assigned@example.com").count() == 0
+
+
+def test_duplicate_email_in_another_workspace_is_not_disclosed_or_blocked(client):
+    agency_a = {"Authorization": "Bearer agency-a-token", "X-Workspace-ID": "client-a"}
+    agency_b = {"Authorization": "Bearer agency-b-token", "X-Workspace-ID": "client-b"}
+    first = client.post("/prospects", json=prospect("shared-across-workspaces@example.com", False),
+                        headers=agency_a).json()
+    second = client.post("/prospects", json=prospect("other@example.com", False), headers=agency_b).json()
+    internal_a = {"Authorization": "Bearer internal-secret", "X-Workspace-ID": "client-a"}
+    internal_b = {"Authorization": "Bearer internal-secret", "X-Workspace-ID": "client-b"}
+    assert client.post(f"/internal/prospects/{first['id']}/verify-email",
+                       json={"verified_email": "shared-across-workspaces@example.com"},
+                       headers=internal_a).status_code == 200
+    response = client.post(f"/internal/prospects/{second['id']}/verify-email",
+                           json={"verified_email": "shared-across-workspaces@example.com"},
+                           headers=internal_b)
+    assert response.status_code == 200
+    assert response.json()["workspace_id"] == "client-b"
+
+
+def test_database_uniqueness_race_returns_409_and_rolls_back(client, monkeypatch):
+    import app
+    from sqlalchemy.exc import IntegrityError
+    _, campaign = launch(client, "race-original@example.com")
+    assert authorize(client, campaign["id"]).status_code == 200
+    original_commit = app.Session.commit
+
+    def conflicting_commit(session):
+        if any(isinstance(item, app.EmailVerificationAudit) for item in session.new):
+            raise IntegrityError("unique workspace email", {}, Exception("concurrent duplicate"))
+        return original_commit(session)
+
+    monkeypatch.setattr(app.Session, "commit", conflicting_commit)
+    response = client.post(
+        f"/internal/prospects/{campaign['prospect_id']}/verify-email",
+        json={"verified_email": "race-replacement@example.com"},
+        headers={"Authorization": "Bearer internal-secret"},
+    )
+    assert response.status_code == 409
+    with app.engine.connect() as connection:
+        prospect_row = connection.exec_driver_sql(
+            "SELECT verified_email, email_verified FROM prospects WHERE id = ?",
+            (campaign["prospect_id"],)).mappings().one()
+        campaign_row = connection.exec_driver_sql(
+            "SELECT live_authorized, authorized_recipient_email, dry_run FROM campaigns WHERE id = ?",
+            (campaign["id"],)).mappings().one()
+        audits = connection.exec_driver_sql(
+            "SELECT count(*) FROM email_verification_audits WHERE prospect_id = ? AND new_email = ?",
+            (campaign["prospect_id"], "race-replacement@example.com")).scalar_one()
+    assert prospect_row["verified_email"] == "race-original@example.com"
+    assert prospect_row["email_verified"] is True
+    assert campaign_row["live_authorized"] is True
+    assert campaign_row["authorized_recipient_email"] == "race-original@example.com"
+    assert campaign_row["dry_run"] is False
+    assert audits == 0
+
+
 def test_prospect_created_with_unverified_email_is_not_email_ready(client):
     response = client.post("/prospects", json=prospect("unverified@example.com", verified=False), headers=headers())
     assert response.status_code == 201

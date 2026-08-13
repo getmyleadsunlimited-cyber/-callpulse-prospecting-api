@@ -96,6 +96,7 @@ paths:
               properties: {verified_email: {type: string, format: email}}
       responses:
         '200': {description: Prospect email normalized and marked verified; changed recipients invalidate campaign authorization and unsent delivery eligibility}
+        '409': {description: The normalized verified email is already assigned to another prospect in the selected workspace}
         '403': {description: Internal administrator authentication required}
         '404': {description: Prospect not found in the selected workspace}
   /campaigns/{campaign_id}/deliveries:
