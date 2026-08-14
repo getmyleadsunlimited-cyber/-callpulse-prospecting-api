@@ -303,6 +303,48 @@ def test_expired_invitation_cannot_be_accepted(client):
     }).status_code == 410
 
 
+def test_existing_identity_with_only_inactive_memberships_can_accept_invitation(client):
+    import app
+    inactive_token, inactive = user_token(
+        client, "inactive-invitee@example.com", "owner",
+        account_id="inactive-account", primary_workspace_id="inactive-workspace",
+    )
+    active_owner, _ = user_token(
+        client, "remaining-owner@example.com", "owner",
+        account_id="inactive-account", primary_workspace_id="inactive-workspace",
+    )
+    assert client.post(
+        f"/users/{inactive['id']}/deactivate",
+        headers={"Authorization": f"Bearer {active_owner}"},
+    ).status_code == 200
+    assert client.get("/me", headers={"Authorization": f"Bearer {inactive_token}"}).status_code == 401
+
+    delivered = []
+    original = app.deliver_invitation_token
+    app.deliver_invitation_token = lambda email, token: delivered.append(token)
+    try:
+        invited = client.post("/users", headers={"Authorization": "Bearer internal-secret"}, json={
+            "email": "inactive-invitee@example.com", "role": "owner",
+            "account_id": "new-account", "account_type": "direct",
+            "primary_workspace_id": "new-workspace", "workspace_ids": [],
+        })
+    finally:
+        app.deliver_invitation_token = original
+    assert invited.status_code == 201
+    assert client.post("/invitations/accept", json={
+        "token": delivered[0], "password": "incorrect-password-value",
+    }).status_code == 401
+    accepted = client.post("/invitations/accept", json={
+        "token": delivered[0], "password": "correct-horse-battery-staple",
+    })
+    assert accepted.status_code == 201
+    assert accepted.json()["account_id"] == "new-account"
+    assert client.post("/auth/login", json={
+        "email": "inactive-invitee@example.com",
+        "password": "correct-horse-battery-staple", "account_id": "new-account",
+    }).status_code == 200
+
+
 def test_workspace_ownership_and_audits_are_enforced(client):
     owner, membership = user_token(client, "audit-owner@example.com", "owner",
                                    account_id="audit-account", primary_workspace_id="audit-workspace")
@@ -450,6 +492,53 @@ context.testDone.then(() => process.stdout.write(JSON.stringify(requests[0].body
 def test_industry_is_required(client):
     body = prospect(); body["industry"] = "Unknown"
     assert client.post("/prospects", json=body, headers=headers()).status_code == 422
+
+
+def test_created_prospect_can_be_immediately_approved_in_same_workspace(client):
+    created = client.post("/prospects", json=prospect("approval@example.com", False), headers=headers())
+    assert created.status_code == 201
+    assert created.json()["workspace_id"] == "callpulse-direct"
+    assert created.json()["status"] == "researched"
+
+    approved = client.post(f"/prospects/{created.json()['id']}/approve", headers=headers())
+    assert approved.status_code == 200
+    assert approved.json()["id"] == created.json()["id"]
+    assert approved.json()["workspace_id"] == "callpulse-direct"
+    assert approved.json()["status"] == "approved"
+    assert approved.json()["email_verified"] is False
+
+
+def test_approve_nonexistent_or_foreign_workspace_prospect_returns_404(client):
+    assert client.post("/prospects/999999/approve", headers=headers()).status_code == 404
+    foreign_headers = {"Authorization": "Bearer direct-two-token"}
+    foreign = client.post("/prospects", json=prospect("foreign-approval@example.com", False),
+                          headers=foreign_headers)
+    assert foreign.status_code == 201
+    assert client.post(f"/prospects/{foreign.json()['id']}/approve", headers=headers()).status_code == 404
+
+
+def test_approve_requires_mutation_role_and_authorized_workspace(client):
+    created = client.post("/prospects", json=prospect("role-approval@example.com", False), headers=headers()).json()
+    user_token(client, "approval-owner@example.com", "owner",
+               account_id="approval-account", primary_workspace_id="callpulse-direct")
+    viewer, _ = user_token(client, "approval-viewer@example.com", "viewer",
+                           account_id="approval-account", primary_workspace_id="callpulse-direct")
+    assert client.post(f"/prospects/{created['id']}/approve",
+                       headers={"Authorization": f"Bearer {viewer}"}).status_code == 403
+    assert client.post(f"/prospects/{created['id']}/approve",
+                       headers={"Authorization": "Bearer agency-a-token",
+                                "X-Workspace-ID": "not-granted"}).status_code == 403
+
+
+def test_approve_is_idempotent_and_does_not_change_email_trust(client):
+    created = client.post("/prospects", json=prospect("retry-approval@example.com", True), headers=headers()).json()
+    first = client.post(f"/prospects/{created['id']}/approve", headers=headers())
+    second = client.post(f"/prospects/{created['id']}/approve", headers=headers())
+    assert first.status_code == second.status_code == 200
+    assert first.json()["status"] == second.json()["status"] == "approved"
+    assert first.json()["updated_at"] == second.json()["updated_at"]
+    assert second.json()["verified_email"] == "retry-approval@example.com"
+    assert second.json()["email_verified"] is False
 
 
 def test_public_caller_cannot_self_assert_verified_email(client):

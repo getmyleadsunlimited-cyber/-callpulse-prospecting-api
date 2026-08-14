@@ -140,6 +140,16 @@ paths:
         required: true
         content: {application/json: {schema: {$ref: '#/components/schemas/Prospect'}}}
       responses: {'201': {description: Created}, '409': {description: Duplicate email}, '422': {description: Unverified or invalid}}
+  /prospects/{prospect_id}/approve:
+    post:
+      operationId: approveProspect
+      summary: Approve a researched prospect in the selected authorized workspace.
+      description: Idempotently changes a researched prospect to approved without verifying its email or initiating outreach.
+      parameters: [{$ref: '#/components/parameters/prospectId'}, {$ref: '#/components/parameters/workspaceId'}]
+      responses:
+        '200': {description: Prospect approved, or the current prospect state returned unchanged on a retry}
+        '403': {description: The authenticated role or selected workspace is not authorized}
+        '404': {description: Prospect not found in the selected workspace}
   /prospects/{prospect_id}/campaigns:
     get:
       operationId: inspectProspectCampaigns
