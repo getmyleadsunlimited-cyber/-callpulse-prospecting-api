@@ -1,0 +1,1 @@
+.button { border:0; border-radius:var(--radius-sm); background:var(--color-brand); color:white; min-height:2.75rem; padding:var(--space-2) var(--space-4); font:inherit; font-weight:700; cursor:pointer; } .button:hover { background:var(--color-brand-hover); } .button:disabled { opacity:.55; cursor:not-allowed; }
