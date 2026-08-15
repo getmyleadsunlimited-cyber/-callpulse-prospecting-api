@@ -1,0 +1,4 @@
+import { CSRF_COOKIE, CSRF_HEADER } from "./csrf-constants";
+import { mapApiError } from "./api-errors";
+function readCookie(name:string):string|undefined { return document.cookie.split("; ").find((entry)=>entry.startsWith(`${name}=`))?.split("=")[1]; }
+export async function browserApi<T>(path:string,init:RequestInit={}):Promise<T> { const headers=new Headers(init.headers); const method=(init.method??"GET").toUpperCase(); if(!["GET","HEAD","OPTIONS"].includes(method)){const csrf=readCookie(CSRF_COOKIE); if(!csrf) throw new Error("Missing CSRF token"); headers.set(CSRF_HEADER,decodeURIComponent(csrf));} if(init.body) headers.set("content-type","application/json"); const response=await fetch(`/api${path}`,{...init,headers,credentials:"same-origin"}); if(!response.ok) throw mapApiError(response.status); return response.json() as Promise<T>; }
