@@ -1,0 +1,161 @@
+.container {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-8);
+}
+
+.header {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-8);
+  box-shadow: var(--shadow-sm);
+}
+
+.title {
+  margin: 0 0 var(--space-3) 0;
+  font-size: 2rem;
+  font-weight: 800;
+  color: var(--color-text);
+}
+
+.subtitle {
+  margin: 0;
+  font-size: 1.125rem;
+  color: var(--color-muted);
+}
+
+.cardsGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--space-6);
+}
+
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-6);
+  box-shadow: var(--shadow-sm);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.cardLabel {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--color-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.cardValue {
+  font-size: 2.5rem;
+  font-weight: 800;
+  color: var(--color-brand);
+}
+
+.unavailable {
+  font-size: 0.875rem;
+  color: var(--color-muted);
+  font-weight: 400;
+}
+
+.section {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-8);
+  box-shadow: var(--shadow-sm);
+}
+
+.sectionTitle {
+  margin: 0 0 var(--space-6) 0;
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--color-text);
+}
+
+.emptyContent {
+  padding: var(--space-8);
+  text-align: center;
+  background: #f9fafb;
+  border-radius: var(--radius-sm);
+  border: 1px dashed var(--color-border);
+}
+
+.emptyContent p {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 0.95rem;
+}
+
+.activityTable {
+  overflow-x: auto;
+}
+
+.activityTable table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.95rem;
+}
+
+.activityTable thead {
+  background: #f9fafb;
+  border-bottom: 2px solid var(--color-border);
+}
+
+.activityTable th {
+  padding: var(--space-4);
+  text-align: left;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.activityTable td {
+  padding: var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-text);
+}
+
+.activityTable tbody tr:hover {
+  background: #f9fafb;
+}
+
+.email {
+  font-family: monospace;
+  font-size: 0.85rem;
+  color: var(--color-muted);
+}
+
+@media (max-width: 42rem) {
+  .cardsGrid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .title {
+    font-size: 1.5rem;
+  }
+
+  .subtitle {
+    font-size: 1rem;
+  }
+
+  .sectionTitle {
+    font-size: 1.25rem;
+  }
+
+  .cardValue {
+    font-size: 2rem;
+  }
+
+  .activityTable table {
+    font-size: 0.85rem;
+  }
+
+  .activityTable th,
+  .activityTable td {
+    padding: var(--space-3);
+  }
+}
