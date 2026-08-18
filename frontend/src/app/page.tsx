@@ -1,4 +1,5 @@
 import { serverApi } from "@/lib/server-api";
+import { getServerSessionToken } from "@/lib/session";
 import { RecoveryDashboard } from "@/components/recovery-dashboard";
 import { ErrorState } from "@/components/states";
 
@@ -91,6 +92,17 @@ async function fetchDashboardData(): Promise<DashboardStats | null> {
 }
 
 export default async function HomePage() {
+  const token = await getServerSessionToken();
+
+  if (!token) {
+    return (
+      <ErrorState
+        title="Session expired"
+        detail="Your session has expired. Please sign in again."
+      />
+    );
+  }
+
   const data = await fetchDashboardData();
 
   if (data === null) {
