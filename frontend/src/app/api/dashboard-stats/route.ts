@@ -1,6 +1,5 @@
 import { serverApi } from "@/lib/server-api";
-import { RecoveryDashboard } from "@/components/recovery-dashboard";
-import { ErrorState } from "@/components/states";
+import { NextResponse } from "next/server";
 
 interface Prospect {
   id: number;
@@ -30,7 +29,7 @@ interface DashboardStats {
   }>;
 }
 
-async function fetchDashboardData(): Promise<DashboardStats | null> {
+export async function GET(): Promise<NextResponse<DashboardStats>> {
   try {
     // Fetch all prospects
     const prospects = await serverApi<Prospect[]>("/prospects");
@@ -77,30 +76,26 @@ async function fetchDashboardData(): Promise<DashboardStats | null> {
       }
     }
 
-    return {
+    const stats: DashboardStats = {
       prospectsCount,
       activeCampaigns,
       recoveredLeads: "not-available",
       deliveriesCount,
       prospectDetails,
     };
+
+    return NextResponse.json(stats);
   } catch (error) {
-    console.error("Failed to fetch dashboard data:", error);
-    return null;
-  }
-}
-
-export default async function HomePage() {
-  const data = await fetchDashboardData();
-
-  if (data === null) {
-    return (
-      <ErrorState
-        title="Failed to load dashboard"
-        detail="Could not connect to the API. Please try refreshing the page."
-      />
+    console.error("Dashboard API error:", error);
+    return NextResponse.json(
+      {
+        prospectsCount: 0,
+        activeCampaigns: 0,
+        recoveredLeads: "not-available" as const,
+        deliveriesCount: 0,
+        prospectDetails: [],
+      },
+      { status: 500 }
     );
   }
-
-  return <RecoveryDashboard initialData={data} />;
 }
